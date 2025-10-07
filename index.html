@@ -39,7 +39,7 @@
   </head>
   <body>
     <header>
-      <input id="rom" type="file" accept=".nes" />
+      <input id="rom" type="file" accept=".sfc" />
       <button id="fullscreenBtn">Fullscreen</button>
 
       <button id="start" disabled>Start</button>
@@ -91,6 +91,19 @@
           this.P = 0x34; // ステータスフラグ (NVmxDIZC)
           this.emulation = true; // 6502互換モード
         }
+        setZN(value) {
+          // 8bitモード想定
+          if ((value & 0xff) === 0) {
+            this.P |= FLAG.Z;
+          } else {
+            this.P &= ~FLAG.Z;
+          }
+          if (value & 0x80) {
+            this.P |= FLAG.N;
+          } else {
+            this.P &= ~FLAG.N;
+          }
+        }
         step(bus) {
           const opcode = bus.read(this.PC);
           this.PC = (this.PC + 1) & 0xffff;
@@ -130,6 +143,125 @@
 
         switch (opcode) {
           case 0xea: // NOP
+            break;
+          case 0xa2: // LDX #imm
+            const immX = bus.read(this.PC++);
+            this.X = immX;
+            this.setZN(this.X);
+            this.cycles += 2;
+            break;
+          case 0xe8: // INX
+            this.X = (this.X + 1) & 0xff;
+            this.setZN(this.X);
+            this.cycles += 2;
+            break;
+
+          case 0xca: // DEX
+            this.X = (this.X - 1) & 0xff;
+            this.setZN(this.X);
+            this.cycles += 2;
+            break;
+
+          case 0xc8: // INY
+            this.Y = (this.Y + 1) & 0xff;
+            this.setZN(this.Y);
+            this.cycles += 2;
+            break;
+
+          case 0x88: // DEY
+            this.Y = (this.Y - 1) & 0xff;
+            this.setZN(this.Y);
+            this.cycles += 2;
+            break;
+          case 0xf0: // BEQ (branch if Z=1)
+            const offBEQ = bus.read(this.PC++);
+            if (this.P & FLAG.Z) {
+              this.PC = (this.PC + ((offBEQ << 24) >> 24)) & 0xffff; // 符号拡張
+              this.cycles += 1;
+            }
+            this.cycles += 2;
+            break;
+
+          case 0xd0: // BNE (branch if Z=0)
+            const offBNE = bus.read(this.PC++);
+            if (!(this.P & FLAG.Z)) {
+              this.PC = (this.PC + ((offBNE << 24) >> 24)) & 0xffff;
+              this.cycles += 1;
+            }
+            this.cycles += 2;
+            break;
+          case 0x48: // PHA
+            bus.write(0x100 | (this.S-- & 0xff), this.A & 0xff);
+            this.cycles += 3;
+            break;
+
+          case 0x68: // PLA
+            this.S = (this.S + 1) & 0x1ff;
+            this.A = bus.read(0x100 | (this.S & 0xff));
+            this.setZN(this.A);
+            this.cycles += 4;
+            break;
+          case 0x18: // CLC
+            this.P &= ~FLAG.C;
+            this.cycles += 2;
+            break;
+
+          case 0x38: // SEC
+            this.P |= FLAG.C;
+            this.cycles += 2;
+            break;
+
+          case 0x58: // CLI
+            this.P &= ~FLAG.I;
+            this.cycles += 2;
+            break;
+
+          case 0x78: // SEI
+            this.P |= FLAG.I;
+            this.cycles += 2;
+            break;
+
+          case 0x8e: // STX ab
+            const loX = bus.read(this.PC++);
+            const hiX = bus.read(this.PC++);
+            bus.write((hiX << 8) | loX, this.X);
+            this.cycles += 4;
+            break;
+          case 0x69: // ADC #imm
+            const valADC = bus.read(this.PC++);
+            let sum = this.A + valADC + (this.P & FLAG.C ? 1 : 0);
+            this.P = this.P & ~(FLAG.C | FLAG.V | FLAG.Z | FLAG.N);
+            if (sum > 0xff) this.P |= FLAG.C;
+            const result = sum & 0xff;
+            if (~(this.A ^ valADC) & (this.A ^ result) & 0x80) this.P |= FLAG.V;
+            this.A = result;
+            this.setZN(this.A);
+            this.cycles += 2;
+            break;
+          case 0x4c: // JMP abs
+            const loJ = bus.read(this.PC++);
+            const hiJ = bus.read(this.PC++);
+            this.PC = (hiJ << 8) | loJ;
+            this.cycles += 3;
+            break;
+
+          case 0x20: // JSR abs
+            const loS = bus.read(this.PC++);
+            const hiS = bus.read(this.PC++);
+            const ret = (this.PC - 1) & 0xffff;
+            bus.write(0x100 | (this.S-- & 0xff), (ret >> 8) & 0xff);
+            bus.write(0x100 | (this.S-- & 0xff), ret & 0xff);
+            this.PC = (hiS << 8) | loS;
+            this.cycles += 6;
+            break;
+          case 0x18: // CLC
+            this.P &= ~FLAG.C;
+            this.cycles += 2;
+            break;
+
+          case 0x38: // SEC
+            this.P |= FLAG.C;
+            this.cycles += 2;
             break;
 
           case 0xa9: // LDA #imm (8bit)
