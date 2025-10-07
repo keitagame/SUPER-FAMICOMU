@@ -67,6 +67,116 @@
     by.keita
 
     <script type="module">
+      class PPU {
+        constructor(ctx) {
+          this.ctx = ctx;
+          this.width = 256;
+          this.height = 224;
+          this.vram = new Uint8Array(64 * 1024); // 64KB
+          this.cgram = new Uint8Array(512); // 512B
+          this.oam = new Uint8Array(544); // 544B
+
+          // --- フレームバッファ ---
+
+          this.buffer = new Uint32Array(this.width * this.height);
+          this.imageData = ctx.createImageData(this.width, this.height);
+        }
+        writeVRAM(addr, value) {
+          this.vram[addr & 0xffff] = value;
+        }
+
+        readVRAM(addr) {
+          return this.vram[addr & 0xffff];
+        }
+
+        // CGRAM書き込み（パレット）
+        writeCGRAM(addr, value) {
+          this.cgram[addr & 0x1ff] = value;
+        }
+
+        readCGRAM(addr) {
+          return this.cgram[addr & 0x1ff];
+        }
+
+        // OAM書き込み（スプライト属性）
+        writeOAM(addr, value) {
+          this.oam[addr % 544] = value;
+        }
+
+        readOAM(addr) {
+          return this.oam[addr % 544];
+        }
+        getColor(index) {
+          const lo = this.cgram[index * 2];
+          const hi = this.cgram[index * 2 + 1];
+          const color = lo | (hi << 8);
+          const r = (color & 0x1f) << 3;
+          const g = ((color >> 5) & 0x1f) << 3;
+          const b = ((color >> 10) & 0x1f) << 3;
+          return (255 << 24) | (b << 16) | (g << 8) | r;
+        }
+
+        // --- タイル1枚を描画 ---
+        drawTile(tileIndex, paletteIndex, dx, dy) {
+          const base = tileIndex * 32; // 1タイル=32バイト
+          for (let row = 0; row < 8; row++) {
+            // 4bpp: 2bitplane×2
+            const p0 = this.vram[base + row * 2];
+            const p1 = this.vram[base + row * 2 + 1];
+            const p2 = this.vram[base + 16 + row * 2];
+            const p3 = this.vram[base + 16 + row * 2 + 1];
+            for (let col = 0; col < 8; col++) {
+              const bit = 7 - col;
+              const colorIndex =
+                ((p0 >> bit) & 1) |
+                (((p1 >> bit) & 1) << 1) |
+                (((p2 >> bit) & 1) << 2) |
+                (((p3 >> bit) & 1) << 3);
+              if (colorIndex === 0) continue; // 透明色
+              const paletteColor = this.getColor(
+                paletteIndex * 16 + colorIndex
+              );
+              this.buffer[(dy + row) * this.width + (dx + col)] = paletteColor;
+            }
+          }
+        }
+
+        // --- 背景マップを描画 ---
+        renderBG1() {
+          // 仮にVRAMの0x0000にBGマップがあるとする
+          const mapBase = 0x0000;
+          for (let ty = 0; ty < 28; ty++) {
+            for (let tx = 0; tx < 32; tx++) {
+              const addr = mapBase + (ty * 32 + tx) * 2;
+              const tileIndex =
+                this.vram[addr] | ((this.vram[addr + 1] & 0x03) << 8);
+              const paletteIndex = (this.vram[addr + 1] >> 2) & 0x07;
+              this.drawTile(tileIndex, paletteIndex, tx * 8, ty * 8);
+            }
+          }
+          this.flush();
+        }
+        // テスト用: グラデーション描画
+        renderTestPattern() {
+          for (let y = 0; y < this.height; y++) {
+            for (let x = 0; x < this.width; x++) {
+              const r = x & 0xff;
+              const g = y & 0xff;
+              const b = 128;
+              this.buffer[y * this.width + x] =
+                (255 << 24) | (b << 16) | (g << 8) | r; // ABGR順
+            }
+          }
+          this.flush();
+        }
+
+        flush() {
+          const buf8 = new Uint8ClampedArray(this.buffer.buffer);
+          this.imageData.data.set(buf8);
+          this.ctx.putImageData(this.imageData, 0, 0);
+        }
+      }
+
       const FLAG = {
         C: 1 << 0,
         Z: 1 << 1,
@@ -289,13 +399,67 @@
       };
 
       class Bus {
-        constructor(rom) {
+        constructor(rom,ppu) {
           this.rom = rom;
+          this.ppu = ppu;
+          this.vramAddr = 0;
+          this.cgramAddr = 0;
+          this.oamAddr = 0;
         }
         read(addr) {
+          if (addr >= 0x2100 && addr <= 0x21ff) {
+            // PPUレジスタ読み取り（未実装）
+            return 0;
+          }
           return this.rom[addr % this.rom.length];
         }
         write(addr, val) {
+          if (addr === 0x2122) {
+            // CGRAMデータポート（簡易版）
+            this.ppu.writeCGRAM(0, val); // とりあえず背景色だけ
+          }
+          switch (addr) {
+            // --- VRAM ---
+            case 0x2116: // VRAMアドレス低位
+              this.vramAddr = (this.vramAddr & 0xff00) | val;
+              break;
+            case 0x2117: // VRAMアドレス高位
+              this.vramAddr = (this.vramAddr & 0x00ff) | (val << 8);
+              break;
+            case 0x2118: // VRAMデータポート (低位)
+              this.ppu.writeVRAM(this.vramAddr, val);
+              this.vramAddr = (this.vramAddr + 1) & 0xffff;
+              break;
+            case 0x2119: // VRAMデータポート (高位)
+              this.ppu.writeVRAM(this.vramAddr, val);
+              this.vramAddr = (this.vramAddr + 1) & 0xffff;
+              break;
+
+            // --- CGRAM ---
+            case 0x2121: // CGRAMアドレス
+              this.cgramAddr = val & 0x1ff;
+              break;
+            case 0x2122: // CGRAMデータ
+              this.ppu.writeCGRAM(this.cgramAddr, val);
+              this.cgramAddr = (this.cgramAddr + 1) & 0x1ff;
+              break;
+
+            // --- OAM ---
+            case 0x2102: // OAMアドレス低位
+              this.oamAddr = (this.oamAddr & 0xff00) | val;
+              break;
+            case 0x2103: // OAMアドレス高位
+              this.oamAddr = (this.oamAddr & 0x00ff) | ((val & 0x01) << 8);
+              break;
+            case 0x2104: // OAMデータ
+              this.ppu.writeOAM(this.oamAddr, val);
+              this.oamAddr = (this.oamAddr + 1) % 544;
+              break;
+
+            default:
+              // ROM以外の領域は無視
+              break;
+          }
           // ROMなので無視、後でWRAMやI/Oを追加
         }
       }
@@ -317,13 +481,17 @@
         }
       }
       document.getElementById("start").addEventListener("click", () => {
-        const bus = new Bus(romData);
+        const canvas = document.getElementById("screen");
+        
         const cpu = new CPU65C816();
-
+        const ctx = canvas.getContext("2d");
+        const ppu = new PPU(ctx);
+        const bus = new Bus(romData,ppu);
         function frame() {
-          for (let i = 0; i < 100; i++) {
+          for (let i = 0; i < 2000; i++) {
             cpu.step(bus);
           }
+          ppu.renderBG1(); // 後で本物の描画に置き換える
           updateDebug(cpu);
           requestAnimationFrame(frame);
         }
