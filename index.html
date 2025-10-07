@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <title>by keita</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        background:black;
+        font-family: ui-sans-serif, system-ui;
+        margin: 16px;
+      }
+      header {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+      canvas {
+        image-rendering: pixelated;
+        border: 1px solid #ccc;
+        background: #000;
+      }
+      .row {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      small {
+        opacity: 0.7;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <input id="rom" type="file" accept=".nes" />
+      <button id="fullscreenBtn">Fullscreen</button>
+
+      <button id="start" disabled>Start</button>
+      <div class="mono" id="status">No ROM</div>
+      <input type="text" id="myInput" value="30" />
+    </header>
+    <div class="row">
+      <canvas id="screen" width="256" height="240"></canvas>
+      <div>
+        <div><b>FPS:</b> <span id="fps">0</span></div>
+        <div><b>CPU PC:</b> <span id="pc" class="mono">0x0000</span></div>
+        <div><b>Cycles:</b> <span id="cyc" class="mono">0</span></div>
+        <div><b>VRAM V:</b><span id="pcp" class="mono">0x0000</span></div>
+        <div><b>VRAM T:</b><span id="ppx" class="mono">0x0000</span></div>
+        <div><b>CPU S:</b><span id="ram" class="mono">0x0000</span></div>
+        <div><b>CPU P:</b><span id="mapper" class="mono">0x0000</span></div>
+        <div><b>APU M:</b><span id="apu" class="mono">0x0000</span></div>
+        <small
+          >Skeleton: Mapper0, iNES, PPU frame timing + NMI, CPU bus/IRQs, opcode
+          hooks</small
+        >
+      </div>
+    </div>
+
+    by.keita
+
+    <script type="module">
+      const FLAG = {
+        C: 1 << 0,
+        Z: 1 << 1,
+        I: 1 << 2,
+        D: 1 << 3,
+        X: 1 << 4,
+        M: 1 << 5,
+        V: 1 << 6,
+        N: 1 << 7,
+      };
+      class CPU65C816 {
+        constructor() {
+          this.PC = 0x8000;
+          this.A = 0; // アキュムレータ (8/16bit)
+          this.X = 0; // Xレジスタ
+          this.Y = 0; // Yレジスタ
+          this.S = 0x1ff; // スタックポインタ (16bit)
+          this.D = 0; // ダイレクトページ
+          this.DB = 0; // データバンク
+          this.PB = 0; // プログラムバンク
+
+          this.P = 0x34; // ステータスフラグ (NVmxDIZC)
+          this.emulation = true; // 6502互換モード
+        }
+        step(bus) {
+          const opcode = bus.read(this.PC);
+          this.PC = (this.PC + 1) & 0xffff;
+
+          switch (opcode) {
+            case 0xea: // NOP
+              this.cycles += 2;
+              break;
+            case 0xa9: // LDA #imm (8bit)
+              const val = bus.read(this.PC);
+              this.PC = (this.PC + 1) & 0xffff;
+              this.A = val;
+              this.cycles += 2;
+              break;
+            default:
+              console.warn("未実装 opcode:", opcode.toString(16));
+              this.cycles += 2;
+              break;
+          }
+        }
+      }
+      function updateDebug(cpu) {
+        document.getElementById("pc").textContent =
+          "0x" + cpu.PC.toString(16).padStart(4, "0");
+        document.getElementById("cyc").textContent = cpu.cycles;
+        document.getElementById("ram").textContent =
+          "A=0x" + cpu.A.toString(16).padStart(2, "0");
+        document.getElementById("mapper").textContent =
+          "X=0x" + cpu.X.toString(16).padStart(2, "0");
+        document.getElementById("apu").textContent =
+          "Y=0x" + cpu.Y.toString(16).padStart(2, "0");
+      }
+
+      CPU65C816.prototype.step = function (bus) {
+        const opcode = bus.read((this.PB << 16) | this.PC);
+        this.PC = (this.PC + 1) & 0xffff;
+
+        switch (opcode) {
+          case 0xea: // NOP
+            break;
+
+          case 0xa9: // LDA #imm (8bit)
+            const value = bus.read((this.PB << 16) | this.PC);
+            this.PC = (this.PC + 1) & 0xffff;
+            this.A = value;
+            this.P =
+              (this.P & ~FLAG.Z & ~FLAG.N) |
+              (this.A === 0 ? FLAG.Z : 0) |
+              (this.A & 0x80 ? FLAG.N : 0);
+            break;
+
+          case 0x8d: // STA abs
+            const lo = bus.read((this.PB << 16) | this.PC);
+            const hi = bus.read((this.PB << 16) | ((this.PC + 1) & 0xffff));
+            this.PC = (this.PC + 2) & 0xffff;
+            const addr = (hi << 8) | lo;
+            bus.write(addr, this.A & 0xff);
+            break;
+
+          default:
+            console.warn(`未実装オペコード: ${opcode.toString(16)}`);
+            break;
+        }
+      };
+
+      class Bus {
+        constructor(rom) {
+          this.rom = rom;
+        }
+        read(addr) {
+          return this.rom[addr % this.rom.length];
+        }
+        write(addr, val) {
+          // ROMなので無視、後でWRAMやI/Oを追加
+        }
+      }
+      let romData = null;
+
+      document.getElementById("rom").addEventListener("change", async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        romData = new Uint8Array(await file.arrayBuffer());
+        document.getElementById(
+          "status"
+        ).textContent = `${file.name} 読み込み (${romData.length} bytes)`;
+        document.getElementById("start").disabled = false;
+      });
+
+      function run(cpu, bus, cycles = 1000) {
+        for (let i = 0; i < cycles; i++) {
+          cpu.step(bus);
+        }
+      }
+      document.getElementById("start").addEventListener("click", () => {
+        const bus = new Bus(romData);
+        const cpu = new CPU65C816();
+
+        function frame() {
+          for (let i = 0; i < 100; i++) {
+            cpu.step(bus);
+          }
+          updateDebug(cpu);
+          requestAnimationFrame(frame);
+        }
+        frame();
+      });
+    </script>
+  </body>
+</html>
