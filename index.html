@@ -75,11 +75,34 @@
           this.vram = new Uint8Array(64 * 1024); // 64KB
           this.cgram = new Uint8Array(512); // 512B
           this.oam = new Uint8Array(544); // 544B
-
+          this.inidisp = 0x80; // 画面OFF
+          this.bgmode = 0; // モード0
           // --- フレームバッファ ---
-
+          // モード0
+          this.vramAddr = 0;
+          this.cgramAddr = 0;
+          this.oamAddr = 0;
+          this.bg1ScrollX = 0;
+          this.bg1ScrollY = 0;
           this.buffer = new Uint32Array(this.width * this.height);
           this.imageData = ctx.createImageData(this.width, this.height);
+        }
+        reset() {
+          // メモリクリア
+          this.vram.fill(0);
+          this.cgram.fill(0);
+          this.oam.fill(0);
+
+          // レジスタ初期化
+          this.inidisp = 0x80; // 画面OFF
+          this.bgmode = 0;
+          this.vramAddr = 0;
+          this.cgramAddr = 0;
+          this.oamAddr = 0;
+
+          // 背景を黒で塗る
+          this.buffer.fill(0xff000000);
+          this.flush();
         }
         writeVRAM(addr, value) {
           this.vram[addr & 0xffff] = value;
@@ -143,6 +166,7 @@
 
         // --- 背景マップを描画 ---
         renderBG1() {
+          const col = this.getColor(0);
           // 仮にVRAMの0x0000にBGマップがあるとする
           const mapBase = 0x0000;
           for (let ty = 0; ty < 28; ty++) {
@@ -157,19 +181,36 @@
           this.flush();
         }
         // テスト用: グラデーション描画
-        renderTestPattern() {
-          for (let y = 0; y < this.height; y++) {
-            for (let x = 0; x < this.width; x++) {
-              const r = x & 0xff;
-              const g = y & 0xff;
-              const b = 128;
-              this.buffer[y * this.width + x] =
-                (255 << 24) | (b << 16) | (g << 8) | r; // ABGR順
+        setScrollX(val) {
+          this.bg1ScrollX = val;
+        }
+        setScrollY(val) {
+          this.bg1ScrollY = val;
+        }
+
+        renderBG1() {
+          const mapBase = 0x0000;
+          for (let ty = 0; ty < 28; ty++) {
+            for (let tx = 0; tx < 32; tx++) {
+              const addr = mapBase + (ty * 32 + tx) * 2;
+              const tileIndex =
+                this.vram[addr] | ((this.vram[addr + 1] & 0x03) << 8);
+              const paletteIndex = (this.vram[addr + 1] >> 2) & 0x07;
+              this.drawTile(
+                tileIndex,
+                paletteIndex,
+                tx * 8 - this.bg1ScrollX,
+                ty * 8 - this.bg1ScrollY
+              );
             }
           }
           this.flush();
         }
-
+        renderBGColor() {
+          const col = this.getColor(0); // パレット0番を背景色に
+          this.buffer.fill(col);
+          this.flush();
+        }
         flush() {
           const buf8 = new Uint8ClampedArray(this.buffer.buffer);
           this.imageData.data.set(buf8);
@@ -399,7 +440,7 @@
       };
 
       class Bus {
-        constructor(rom,ppu) {
+        constructor(rom, ppu) {
           this.rom = rom;
           this.ppu = ppu;
           this.vramAddr = 0;
@@ -436,6 +477,7 @@
               break;
 
             // --- CGRAM ---
+
             case 0x2121: // CGRAMアドレス
               this.cgramAddr = val & 0x1ff;
               break;
@@ -464,6 +506,25 @@
         }
       }
       let romData = null;
+      function resetCPU(cpu, romData, mapping = "LoROM") {
+        let lo, hi;
+
+        if (mapping === "LoROM") {
+          lo = romData[0x7ffc];
+          hi = romData[0x7ffd];
+        } else if (mapping === "HiROM") {
+          lo = romData[0xfffc];
+          hi = romData[0xfffd];
+        } else {
+          throw new Error("Unknown mapping type");
+        }
+
+        cpu.PC = (hi << 8) | lo; // リセットベクタからPCを設定
+        cpu.PB = 0x00; // プログラムバンクは0から開始
+        cpu.S = 0x1ff; // スタックポインタ初期化
+        cpu.P = 0x34; // ステータスフラグ初期値
+        cpu.emulation = true; // 6502互換モードで開始
+      }
 
       document.getElementById("rom").addEventListener("change", async (e) => {
         const file = e.target.files[0];
@@ -482,19 +543,26 @@
       }
       document.getElementById("start").addEventListener("click", () => {
         const canvas = document.getElementById("screen");
-        
+
         const cpu = new CPU65C816();
         const ctx = canvas.getContext("2d");
         const ppu = new PPU(ctx);
-        const bus = new Bus(romData,ppu);
+        const bus = new Bus(romData, ppu);
+        resetCPU(cpu, romData, "LoROM");
+        ppu.reset();
         function frame() {
           for (let i = 0; i < 2000; i++) {
             cpu.step(bus);
           }
+          // CPUがCGRAMに色を書き込む（青色）
+
+          // 背景色を描画
+          ppu.renderBGColor();
           ppu.renderBG1(); // 後で本物の描画に置き換える
           updateDebug(cpu);
           requestAnimationFrame(frame);
         }
+
         frame();
       });
     </script>
