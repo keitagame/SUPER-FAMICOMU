@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <title>SNES by keita</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+  :root {
+        color-scheme: light dark;
+      }
+      body {
+        background:rgb(0, 0, 0);
+        font-family: ui-sans-serif, system-ui;
+        margin: 16px;
+      }
+      header {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+      canvas{
+        
+        height: 100%;              /* コンテナ幅に合わせる */
+      aspect-ratio: 256 / 240;  /* 内部解像度の比率を維持 */
+        image-rendering: pixelated;
+        border: 1px solid #000000;
+        background: #000;
+      }
+      .row div{
+        display:none;
+      }
+      .row {
+        padding-top:0px;
+height:83vh;
+justify-content: center; 
+        display: flex;
+        gap: 12px;
+        align-items: center;
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      small {
+        opacity: 0.7;
+      }
+      #romSelect{
+display:none;
+}
+button{
+padding:10px;
+background:rgb(0, 0, 0);
+color:rgb(255, 255, 255);
+border:1px solid rgb(255, 255, 255);
+}
+    </style>
+  </head>
+  <body>
+    <header>
+      <input id="rom" type="file" accept=".sfc" />
+      <button id="fullscreenBtn">Fullscreen</button>
+
+      <button id="start" disabled>Start</button>
+      <div class="mono" id="status">No ROM</div>
+      <input type="text" id="myInput" value="30" />
+    </header>
+    <div class="row">
+      <canvas id="screen" width="256" height="240"></canvas>
+      <div>
+        <div><b>FPS:</b> <span id="fps">0</span></div>
+        <div><b>CPU PC:</b> <span id="pc" class="mono">0x0000</span></div>
+        <div><b>Cycles:</b> <span id="cyc" class="mono">0</span></div>
+        <div><b>VRAM V:</b><span id="pcp" class="mono">0x0000</span></div>
+        <div><b>VRAM T:</b><span id="ppx" class="mono">0x0000</span></div>
+        <div><b>CPU S:</b><span id="ram" class="mono">0x0000</span></div>
+        <div><b>CPU P:</b><span id="mapper" class="mono">0x0000</span></div>
+        <div><b>APU M:</b><span id="apu" class="mono">0x0000</span></div>
+        <small
+          >Skeleton: Mapper0, iNES, PPU frame timing + NMI, CPU bus/IRQs, opcode
+          hooks</small
+        >
+      </div>
+    </div>
+
+    
+
+    <script type="module">
+      class PPU {
+        constructor(ctx) {
+          this.ctx = ctx;
+          this.width = 256;
+          this.height = 224;
+          this.vram = new Uint8Array(64 * 1024); // 64KB
+          this.cgram = new Uint8Array(512); // 512B
+          this.oam = new Uint8Array(544); // 544B
+          this.inidisp = 0x80; // 画面OFF
+          this.bgmode = 0; // モード0
+          // --- フレームバッファ ---
+          // モード0
+          this.vramAddr = 0;
+          this.cgramAddr = 0;
+          this.oamAddr = 0;
+          this.bg1ScrollX = 0;
+          this.bg1ScrollY = 0;
+          this.buffer = new Uint32Array(this.width * this.height);
+          this.imageData = ctx.createImageData(this.width, this.height);
+        }
+        reset() {
+          // メモリクリア
+          this.vram.fill(0);
+          this.cgram.fill(0);
+          this.oam.fill(0);
+
+          // レジスタ初期化
+          this.inidisp = 0x80; // 画面OFF
+          this.bgmode = 0;
+          this.vramAddr = 0;
+          this.cgramAddr = 0;
+          this.oamAddr = 0;
+
+          // 背景を黒で塗る
+          this.buffer.fill(0xff000000);
+          this.flush();
+        }
+        writeVRAM(addr, value) {
+          this.vram[addr & 0xffff] = value;
+        }
+
+        readVRAM(addr) {
+          return this.vram[addr & 0xffff];
+        }
+
+        // CGRAM書き込み（パレット）
+        writeCGRAM(addr, value) {
+          this.cgram[addr & 0x1ff] = value;
+        }
+
+        readCGRAM(addr) {
+          return this.cgram[addr & 0x1ff];
+        }
+
+        // OAM書き込み（スプライト属性）
+        writeOAM(addr, value) {
+          this.oam[addr % 544] = value;
+        }
+
+        readOAM(addr) {
+          return this.oam[addr % 544];
+        }
+        getColor(index) {
+          const lo = this.cgram[index * 2];
+          const hi = this.cgram[index * 2 + 1];
+          const color = lo | (hi << 8);
+          const r = (color & 0x1f) << 3;
+          const g = ((color >> 5) & 0x1f) << 3;
+          const b = ((color >> 10) & 0x1f) << 3;
+          return (255 << 24) | (b << 16) | (g << 8) | r;
+        }
+
+        // --- タイル1枚を描画 ---
+        drawTile(tileIndex, paletteIndex, dx, dy) {
+          const base = tileIndex * 32; // 1タイル=32バイト
+          for (let row = 0; row < 8; row++) {
+            // 4bpp: 2bitplane×2
+            const p0 = this.vram[base + row * 2];
+            const p1 = this.vram[base + row * 2 + 1];
+            const p2 = this.vram[base + 16 + row * 2];
+            const p3 = this.vram[base + 16 + row * 2 + 1];
+            for (let col = 0; col < 8; col++) {
+              const bit = 7 - col;
+              const colorIndex =
+                ((p0 >> bit) & 1) |
+                (((p1 >> bit) & 1) << 1) |
+                (((p2 >> bit) & 1) << 2) |
+                (((p3 >> bit) & 1) << 3);
+              if (colorIndex === 0) continue; // 透明色
+              const paletteColor = this.getColor(
+                paletteIndex * 16 + colorIndex
+              );
+              this.buffer[(dy + row) * this.width + (dx + col)] = paletteColor;
+            }
+          }
+        }
+
+        // --- 背景マップを描画 ---
+        renderBG1() {
+          const col = this.getColor(0);
+          // 仮にVRAMの0x0000にBGマップがあるとする
+          const mapBase = 0x0000;
+          for (let ty = 0; ty < 28; ty++) {
+            for (let tx = 0; tx < 32; tx++) {
+              const addr = mapBase + (ty * 32 + tx) * 2;
+              const tileIndex =
+                this.vram[addr] | ((this.vram[addr + 1] & 0x03) << 8);
+              const paletteIndex = (this.vram[addr + 1] >> 2) & 0x07;
+              this.drawTile(tileIndex, paletteIndex, tx * 8, ty * 8);
+            }
+          }
+          this.flush();
+        }
+        // テスト用: グラデーション描画
+        setScrollX(val) {
+          this.bg1ScrollX = val;
+        }
+        setScrollY(val) {
+          this.bg1ScrollY = val;
+        }
+
+        renderBG1() {
+          const mapBase = 0x0000;
+          for (let ty = 0; ty < 28; ty++) {
+            for (let tx = 0; tx < 32; tx++) {
+              const addr = mapBase + (ty * 32 + tx) * 2;
+              const tileIndex =
+                this.vram[addr] | ((this.vram[addr + 1] & 0x03) << 8);
+              const paletteIndex = (this.vram[addr + 1] >> 2) & 0x07;
+              this.drawTile(
+                tileIndex,
+                paletteIndex,
+                tx * 8 - this.bg1ScrollX,
+                ty * 8 - this.bg1ScrollY
+              );
+            }
+          }
+          this.flush();
+        }
+        renderBGColor() {
+          const col = this.getColor(0); // パレット0番を背景色に
+          this.buffer.fill(col);
+          this.flush();
+        }
+        flush() {
+          const buf8 = new Uint8ClampedArray(this.buffer.buffer);
+          this.imageData.data.set(buf8);
+          this.ctx.putImageData(this.imageData, 0, 0);
+        }
+      }
+
+      const FLAG = {
+        C: 1 << 0,
+        Z: 1 << 1,
+        I: 1 << 2,
+        D: 1 << 3,
+        X: 1 << 4,
+        M: 1 << 5,
+        V: 1 << 6,
+        N: 1 << 7,
+      };
+      class CPU65C816 {
+        constructor() {
+          this.PC = 0x8000;
+          this.A = 0; // アキュムレータ (8/16bit)
+          this.X = 0; // Xレジスタ
+          this.Y = 0; // Yレジスタ
+          this.S = 0x1ff; // スタックポインタ (16bit)
+          this.D = 0; // ダイレクトページ
+          this.DB = 0; // データバンク
+          this.PB = 0; // プログラムバンク
+
+          this.P = 0x34; // ステータスフラグ (NVmxDIZC)
+          this.emulation = true; // 6502互換モード
+        }
+        setZN(value) {
+          // 8bitモード想定
+          if ((value & 0xff) === 0) {
+            this.P |= FLAG.Z;
+          } else {
+            this.P &= ~FLAG.Z;
+          }
+          if (value & 0x80) {
+            this.P |= FLAG.N;
+          } else {
+            this.P &= ~FLAG.N;
+          }
+        }
+        step(bus) {
+          const opcode = bus.read(this.PC);
+          this.PC = (this.PC + 1) & 0xffff;
+
+          switch (opcode) {
+            case 0xea: // NOP
+              this.cycles += 2;
+              break;
+            case 0xa9: // LDA #imm (8bit)
+              const val = bus.read(this.PC);
+              this.PC = (this.PC + 1) & 0xffff;
+              this.A = val;
+              this.cycles += 2;
+              break;
+            default:
+              console.warn("未実装 opcode:", opcode.toString(16));
+              this.cycles += 2;
+              break;
+          }
+        }
+      }
+      function updateDebug(cpu) {
+        document.getElementById("pc").textContent =
+          "0x" + cpu.PC.toString(16).padStart(4, "0");
+        document.getElementById("cyc").textContent = cpu.cycles;
+        document.getElementById("ram").textContent =
+          "A=0x" + cpu.A.toString(16).padStart(2, "0");
+        document.getElementById("mapper").textContent =
+          "X=0x" + cpu.X.toString(16).padStart(2, "0");
+        document.getElementById("apu").textContent =
+          "Y=0x" + cpu.Y.toString(16).padStart(2, "0");
+      }
+
+      CPU65C816.prototype.step = function (bus) {
+        const opcode = bus.read((this.PB << 16) | this.PC);
+        this.PC = (this.PC + 1) & 0xffff;
+
+        switch (opcode) {
+          case 0xea: // NOP
+            break;
+          case 0xa2: // LDX #imm
+            const immX = bus.read(this.PC++);
+            this.X = immX;
+            this.setZN(this.X);
+            this.cycles += 2;
+            break;
+          case 0xe8: // INX
+            this.X = (this.X + 1) & 0xff;
+            this.setZN(this.X);
+            this.cycles += 2;
+            break;
+
+          case 0xca: // DEX
+            this.X = (this.X - 1) & 0xff;
+            this.setZN(this.X);
+            this.cycles += 2;
+            break;
+
+          case 0xc8: // INY
+            this.Y = (this.Y + 1) & 0xff;
+            this.setZN(this.Y);
+            this.cycles += 2;
+            break;
+
+          case 0x88: // DEY
+            this.Y = (this.Y - 1) & 0xff;
+            this.setZN(this.Y);
+            this.cycles += 2;
+            break;
+          case 0xf0: // BEQ (branch if Z=1)
+            const offBEQ = bus.read(this.PC++);
+            if (this.P & FLAG.Z) {
+              this.PC = (this.PC + ((offBEQ << 24) >> 24)) & 0xffff; // 符号拡張
+              this.cycles += 1;
+            }
+            this.cycles += 2;
+            break;
+
+          case 0xd0: // BNE (branch if Z=0)
+            const offBNE = bus.read(this.PC++);
+            if (!(this.P & FLAG.Z)) {
+              this.PC = (this.PC + ((offBNE << 24) >> 24)) & 0xffff;
+              this.cycles += 1;
+            }
+            this.cycles += 2;
+            break;
+          case 0x48: // PHA
+            bus.write(0x100 | (this.S-- & 0xff), this.A & 0xff);
+            this.cycles += 3;
+            break;
+
+          case 0x68: // PLA
+            this.S = (this.S + 1) & 0x1ff;
+            this.A = bus.read(0x100 | (this.S & 0xff));
+            this.setZN(this.A);
+            this.cycles += 4;
+            break;
+          case 0x18: // CLC
+            this.P &= ~FLAG.C;
+            this.cycles += 2;
+            break;
+
+          case 0x38: // SEC
+            this.P |= FLAG.C;
+            this.cycles += 2;
+            break;
+
+          case 0x58: // CLI
+            this.P &= ~FLAG.I;
+            this.cycles += 2;
+            break;
+
+          case 0x78: // SEI
+            this.P |= FLAG.I;
+            this.cycles += 2;
+            break;
+
+          case 0x8e: // STX ab
+            const loX = bus.read(this.PC++);
+            const hiX = bus.read(this.PC++);
+            bus.write((hiX << 8) | loX, this.X);
+            this.cycles += 4;
+            break;
+          case 0x69: // ADC #imm
+            const valADC = bus.read(this.PC++);
+            let sum = this.A + valADC + (this.P & FLAG.C ? 1 : 0);
+            this.P = this.P & ~(FLAG.C | FLAG.V | FLAG.Z | FLAG.N);
+            if (sum > 0xff) this.P |= FLAG.C;
+            const result = sum & 0xff;
+            if (~(this.A ^ valADC) & (this.A ^ result) & 0x80) this.P |= FLAG.V;
+            this.A = result;
+            this.setZN(this.A);
+            this.cycles += 2;
+            break;
+          case 0x4c: // JMP abs
+            const loJ = bus.read(this.PC++);
+            const hiJ = bus.read(this.PC++);
+            this.PC = (hiJ << 8) | loJ;
+            this.cycles += 3;
+            break;
+
+          case 0x20: // JSR abs
+            const loS = bus.read(this.PC++);
+            const hiS = bus.read(this.PC++);
+            const ret = (this.PC - 1) & 0xffff;
+            bus.write(0x100 | (this.S-- & 0xff), (ret >> 8) & 0xff);
+            bus.write(0x100 | (this.S-- & 0xff), ret & 0xff);
+            this.PC = (hiS << 8) | loS;
+            this.cycles += 6;
+            break;
+          case 0x18: // CLC
+            this.P &= ~FLAG.C;
+            this.cycles += 2;
+            break;
+
+          case 0x38: // SEC
+            this.P |= FLAG.C;
+            this.cycles += 2;
+            break;
+
+          case 0xa9: // LDA #imm (8bit)
+            const value = bus.read((this.PB << 16) | this.PC);
+            this.PC = (this.PC + 1) & 0xffff;
+            this.A = value;
+            this.P =
+              (this.P & ~FLAG.Z & ~FLAG.N) |
+              (this.A === 0 ? FLAG.Z : 0) |
+              (this.A & 0x80 ? FLAG.N : 0);
+            break;
+
+          case 0x8d: // STA abs
+            const lo = bus.read((this.PB << 16) | this.PC);
+            const hi = bus.read((this.PB << 16) | ((this.PC + 1) & 0xffff));
+            this.PC = (this.PC + 2) & 0xffff;
+            const addr = (hi << 8) | lo;
+            bus.write(addr, this.A & 0xff);
+            break;
+
+          default:
+            console.warn(`未実装オペコード: ${opcode.toString(16)}`);
+            break;
+        }
+      };
+
+      class Bus {
+        constructor(rom, ppu) {
+          this.rom = rom;
+          this.ppu = ppu;
+          this.vramAddr = 0;
+          this.cgramAddr = 0;
+          this.oamAddr = 0;
+        }
+        read(addr) {
+          if (addr >= 0x2100 && addr <= 0x21ff) {
+            // PPUレジスタ読み取り（未実装）
+            return 0;
+          }
+          return this.rom[addr % this.rom.length];
+        }
+        write(addr, val) {
+          if (addr === 0x2122) {
+            // CGRAMデータポート（簡易版）
+            this.ppu.writeCGRAM(0, val); // とりあえず背景色だけ
+          }
+          switch (addr) {
+            // --- VRAM ---
+            case 0x2116: // VRAMアドレス低位
+              this.vramAddr = (this.vramAddr & 0xff00) | val;
+              break;
+            case 0x2117: // VRAMアドレス高位
+              this.vramAddr = (this.vramAddr & 0x00ff) | (val << 8);
+              break;
+            case 0x2118: // VRAMデータポート (低位)
+              this.ppu.writeVRAM(this.vramAddr, val);
+              this.vramAddr = (this.vramAddr + 1) & 0xffff;
+              break;
+            case 0x2119: // VRAMデータポート (高位)
+              this.ppu.writeVRAM(this.vramAddr, val);
+              this.vramAddr = (this.vramAddr + 1) & 0xffff;
+              break;
+
+            // --- CGRAM ---
+
+            case 0x2121: // CGRAMアドレス
+              this.cgramAddr = val & 0x1ff;
+              break;
+            case 0x2122: // CGRAMデータ
+              this.ppu.writeCGRAM(this.cgramAddr, val);
+              this.cgramAddr = (this.cgramAddr + 1) & 0x1ff;
+              break;
+
+            // --- OAM ---
+            case 0x2102: // OAMアドレス低位
+              this.oamAddr = (this.oamAddr & 0xff00) | val;
+              break;
+            case 0x2103: // OAMアドレス高位
+              this.oamAddr = (this.oamAddr & 0x00ff) | ((val & 0x01) << 8);
+              break;
+            case 0x2104: // OAMデータ
+              this.ppu.writeOAM(this.oamAddr, val);
+              this.oamAddr = (this.oamAddr + 1) % 544;
+              break;
+
+            default:
+              // ROM以外の領域は無視
+              break;
+          }
+          // ROMなので無視、後でWRAMやI/Oを追加
+        }
+      }
+      let romData = null;
+      function resetCPU(cpu, romData, mapping = "LoROM") {
+        let lo, hi;
+
+        if (mapping === "LoROM") {
+          lo = romData[0x7ffc];
+          hi = romData[0x7ffd];
+        } else if (mapping === "HiROM") {
+          lo = romData[0xfffc];
+          hi = romData[0xfffd];
+        } else {
+          throw new Error("Unknown mapping type");
+        }
+
+        cpu.PC = (hi << 8) | lo; // リセットベクタからPCを設定
+        cpu.PB = 0x00; // プログラムバンクは0から開始
+        cpu.S = 0x1ff; // スタックポインタ初期化
+        cpu.P = 0x34; // ステータスフラグ初期値
+        cpu.emulation = true; // 6502互換モードで開始
+      }
+
+      document.getElementById("rom").addEventListener("change", async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        romData = new Uint8Array(await file.arrayBuffer());
+        document.getElementById(
+          "status"
+        ).textContent = `${file.name} 読み込み (${romData.length} bytes)`;
+        document.getElementById("start").disabled = false;
+      });
+
+      function run(cpu, bus, cycles = 1000) {
+        for (let i = 0; i < cycles; i++) {
+          cpu.step(bus);
+        }
+      }
+      document.getElementById("start").addEventListener("click", () => {
+        const canvas = document.getElementById("screen");
+
+        const cpu = new CPU65C816();
+        const ctx = canvas.getContext("2d");
+        const ppu = new PPU(ctx);
+        const bus = new Bus(romData, ppu);
+        resetCPU(cpu, romData, "LoROM");
+        ppu.reset();
+        function frame() {
+          for (let i = 0; i < 2000; i++) {
+            cpu.step(bus);
+          }
+          // CPUがCGRAMに色を書き込む（青色）
+
+          // 背景色を描画
+          ppu.renderBGColor();
+          ppu.renderBG1(); // 後で本物の描画に置き換える
+          updateDebug(cpu);
+          requestAnimationFrame(frame);
+        }
+
+        frame();
+      });
+    </script>
+  </body>
+</html>
