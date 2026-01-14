@@ -825,6 +825,14 @@ this.wram = new Uint8Array(128 * 1024); // 128KB WRAM
 this.joypad1 = 0;
 this.joypadShift = 0;
 this.nmiFlag = false;
+// ADD
+this.dma = {
+  enabled: false,
+  src: 0,
+  dst: 0,
+  size: 0,
+  mode: 0
+};
 
         }
        read(addr) {
@@ -858,21 +866,84 @@ this.nmiFlag = false;
 
   return 0;
 }
+// ADD
+runDMA() {
+  let src = this.dma.src;
+  let dst = this.dma.dst;
+  let size = this.dma.size || 0x10000;
+
+  for (let i = 0; i < size; i++) {
+    const data = this.read(src);
+
+    // --- 転送先 ---
+    switch (dst) {
+      case 0x2118: // VRAM low
+      case 0x2119: // VRAM high
+      case 0x2122: // CGRAM
+      case 0x2104: // OAM
+        this.write(dst, data);
+        break;
+    }
+
+    src = (src + 1) & 0xffffff;
+  }
+}
 
        write(addr, val) {
   addr &= 0xffffff;
 
   // --- WRAM ---
-  if (addr < 0x200000) {
-    this.wram[addr & 0x1ffff] = val;
-    return;
-  }
+  // --- WRAM (正しい範囲) ---
+if (addr >= 0x7e0000 && addr <= 0x7fffff) {
+  this.wram[addr & 0x1ffff] = val;
+  return;
+}
+
 
   // --- Controller latch ---
   if (addr === 0x4016) {
     if (val & 1) this.joypadShift = this.joypad1;
     return;
   }
+// ADD in Bus.write()
+if (addr === 0x2100) { // INIDISP
+  this.ppu.inidisp = val;
+  return;
+}
+
+// --- DMA registers ---
+if (addr === 0x4300) {        // DMAP0
+  this.dma.mode = val;
+  return;
+}
+if (addr === 0x4301) {        // BBAD0
+  this.dma.dst = 0x2100 | val;
+  return;
+}
+if (addr === 0x4302) {        // A1T0L
+  this.dma.src = (this.dma.src & 0xffff00) | val;
+  return;
+}
+if (addr === 0x4303) {        // A1T0H
+  this.dma.src = (this.dma.src & 0xff00ff) | (val << 8);
+  return;
+}
+if (addr === 0x4304) {        // A1B0
+  this.dma.src = (this.dma.src & 0x00ffff) | (val << 16);
+  return;
+}
+if (addr === 0x4305) {        // DAS0L
+  this.dma.size = (this.dma.size & 0xff00) | val;
+  return;
+}
+if (addr === 0x4306) {        // DAS0H
+  this.dma.size = (this.dma.size & 0x00ff) | (val << 8);
+  return;
+}
+if (addr === 0x420b && (val & 1)) {
+  this.runDMA();
+  return;
+}
 
   // --- 既存PPU処理はそのまま ---
 
@@ -985,14 +1056,21 @@ bus.joypad1 =
 
         function frame() {
           // MODIFY frame()
+// FORCE background color (青)
+
 for (let i = 0; i < 20000; i++) cpu.step(bus);
 ppu.startVBlank(bus);
 // MODIFY frame()
 
 ppu.renderSprites();
+//bus.write(0x2100, 0x0F); // brightness max, screen ON
 
 document.getElementById("addr").textContent="0x"+cpu.PC.toString(16);
           // CPUがCGRAMに色を書き込む（青色）
+console.log(ppu.cgram.slice(0, 4));
+
+
+console.log(ppu.inidisp);
 
           // 背景色を描画
           ppu.renderBGColor();
