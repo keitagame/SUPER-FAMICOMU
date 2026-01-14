@@ -62,6 +62,7 @@ border:1px solid rgb(255, 255, 255);
 
       <button id="start" disabled>Start</button>
       <div class="mono" id="status">No ROM</div>
+      <div class="mono" id="addr">0x0000</div>
       <input type="text" id="myInput" value="30" />
     </header>
     <div class="row">
@@ -156,6 +157,18 @@ border:1px solid rgb(255, 255, 255);
           const b = ((color >> 10) & 0x1f) << 3;
           return (255 << 24) | (b << 16) | (g << 8) | r;
         }
+// ADD
+renderSprites() {
+  for (let i = 0; i < 128; i++) {
+    const o = i * 4;
+    const y = this.oam[o];
+    const tile = this.oam[o + 1];
+    const attr = this.oam[o + 2];
+    const x = this.oam[o + 3];
+    const pal = attr & 0x7;
+    this.drawTile(tile, pal, x, y);
+  }
+}
 
         // --- タイル1枚を描画 ---
         drawTile(tileIndex, paletteIndex, dx, dy) {
@@ -205,6 +218,10 @@ border:1px solid rgb(255, 255, 255);
         setScrollY(val) {
           this.bg1ScrollY = val;
         }
+// ADD in PPU
+startVBlank(bus) {
+  bus.nmiFlag = true;
+}
 
         renderBG1() {
           const mapBase = 0x0000;
@@ -249,19 +266,35 @@ border:1px solid rgb(255, 255, 255);
       class CPU65C816 {
         constructor() {
           this.PC = 0x8000;
-          this.A = 0; // アキュムレータ (8/16bit)
-          this.X = 0; // Xレジスタ
-          this.Y = 0; // Yレジスタ
-          this.S = 0x1ff; // スタックポインタ (16bit)
-          this.D = 0; // ダイレクトページ
-          this.DB = 0; // データバンク
-          this.PB = 0; // プログラムバンク
-
-          this.P = 0x34; // ステータスフラグ (NVmxDIZC)
-          this.emulation = true; // 6502互換モード
+          this.A = 0;
+          this.X = 0;
+          this.Y = 0;
+          this.S = 0x1ff;
+          this.D = 0;
+          this.DB = 0;
+          this.PB = 0;
+          this.P = 0x34;
+          this.emulation = true;
+          this.cycles = 0;
         }
+        // ADD inside CPU class
+read16(bus, addr) {
+  const lo = bus.read(addr);
+  const hi = bus.read((addr + 1) & 0xffff);
+  return lo | (hi << 8);
+}
+
+imm8(bus) {
+  return bus.read((this.PB << 16) | this.PC++);
+}
+
+abs(bus) {
+  const lo = this.imm8(bus);
+  const hi = this.imm8(bus);
+  return (this.DB << 16) | (hi << 8) | lo;
+}
+
         setZN(value) {
-          // 8bitモード想定
           if ((value & 0xff) === 0) {
             this.P |= FLAG.Z;
           } else {
@@ -273,188 +306,511 @@ border:1px solid rgb(255, 255, 255);
             this.P &= ~FLAG.N;
           }
         }
+
         step(bus) {
-          const opcode = bus.read(this.PC);
+          const opcode = bus.read((this.PB << 16) | this.PC);
           this.PC = (this.PC + 1) & 0xffff;
+// ADD at top of CPU.step()
+if (bus.nmiFlag && !(this.P & FLAG.I)) {
+  bus.nmiFlag = false;
+
+  bus.write(0x100 | (this.S-- & 0xff), (this.PC >> 8) & 0xff);
+  bus.write(0x100 | (this.S-- & 0xff), this.PC & 0xff);
+  bus.write(0x100 | (this.S-- & 0xff), this.P);
+
+  const lo = bus.read(0xffea);
+  const hi = bus.read(0xffeb);
+  this.PC = lo | (hi << 8);
+  this.cycles += 7;
+  return;
+}
 
           switch (opcode) {
+            // Load/Store operations
+            case 0xa9: // LDA #imm
+              this.A = bus.read((this.PB << 16) | this.PC);
+              this.PC = (this.PC + 1) & 0xffff;
+              this.setZN(this.A);
+              this.cycles += 2;
+              break;
+
+            case 0xa5: // LDA dp
+              const dpA = bus.read((this.PB << 16) | this.PC++);
+              this.A = bus.read((this.D + dpA) & 0xffff);
+              this.setZN(this.A);
+              this.cycles += 3;
+              break;
+
+            case 0xad: // LDA abs
+              const loA = bus.read((this.PB << 16) | this.PC++);
+              const hiA = bus.read((this.PB << 16) | this.PC++);
+              this.A = bus.read((hiA << 8) | loA);
+              this.setZN(this.A);
+              this.cycles += 4;
+              break;
+
+            case 0xa2: // LDX #imm
+              this.X = bus.read((this.PB << 16) | this.PC++);
+              this.setZN(this.X);
+              this.cycles += 2;
+              break;
+
+            case 0xa6: // LDX dp
+              const dpX = bus.read((this.PB << 16) | this.PC++);
+              this.X = bus.read((this.D + dpX) & 0xffff);
+              this.setZN(this.X);
+              this.cycles += 3;
+              break;
+
+            case 0xae: // LDX abs
+              const loLX = bus.read((this.PB << 16) | this.PC++);
+              const hiLX = bus.read((this.PB << 16) | this.PC++);
+              this.X = bus.read((hiLX << 8) | loLX);
+              this.setZN(this.X);
+              this.cycles += 4;
+              break;
+
+            case 0xa0: // LDY #imm
+              this.Y = bus.read((this.PB << 16) | this.PC++);
+              this.setZN(this.Y);
+              this.cycles += 2;
+              break;
+// ADD opcode
+case 0xbd: { // LDA abs,X
+  const base = this.abs(bus);
+  this.A = bus.read((base + this.X) & 0xffffff);
+  this.setZN(this.A);
+  this.cycles += 4;
+  break;
+}
+
+            case 0xa4: // LDY dp
+              const dpY = bus.read((this.PB << 16) | this.PC++);
+              this.Y = bus.read((this.D + dpY) & 0xffff);
+              this.setZN(this.Y);
+              this.cycles += 3;
+              break;
+
+            case 0xac: // LDY abs
+              const loLY = bus.read((this.PB << 16) | this.PC++);
+              const hiLY = bus.read((this.PB << 16) | this.PC++);
+              this.Y = bus.read((hiLY << 8) | loLY);
+              this.setZN(this.Y);
+              this.cycles += 4;
+              break;
+
+            case 0x85: // STA dp
+              const dpSA = bus.read((this.PB << 16) | this.PC++);
+              bus.write((this.D + dpSA) & 0xffff, this.A & 0xff);
+              this.cycles += 3;
+              break;
+
+            case 0x8d: // STA abs
+              const loSA = bus.read((this.PB << 16) | this.PC++);
+              const hiSA = bus.read((this.PB << 16) | this.PC++);
+              bus.write((hiSA << 8) | loSA, this.A & 0xff);
+              this.cycles += 4;
+              break;
+
+            case 0x86: // STX dp
+              const dpSX = bus.read((this.PB << 16) | this.PC++);
+              bus.write((this.D + dpSX) & 0xffff, this.X & 0xff);
+              this.cycles += 3;
+              break;
+
+            case 0x8e: // STX abs
+              const loSX = bus.read((this.PB << 16) | this.PC++);
+              const hiSX = bus.read((this.PB << 16) | this.PC++);
+              bus.write((hiSX << 8) | loSX, this.X & 0xff);
+              this.cycles += 4;
+              break;
+
+            case 0x84: // STY dp
+              const dpSY = bus.read((this.PB << 16) | this.PC++);
+              bus.write((this.D + dpSY) & 0xffff, this.Y & 0xff);
+              this.cycles += 3;
+              break;
+
+            case 0x8c: // STY abs
+              const loSY = bus.read((this.PB << 16) | this.PC++);
+              const hiSY = bus.read((this.PB << 16) | this.PC++);
+              bus.write((hiSY << 8) | loSY, this.Y & 0xff);
+              this.cycles += 4;
+              break;
+
+            // Increment/Decrement
+            case 0xe8: // INX
+              this.X = (this.X + 1) & 0xff;
+              this.setZN(this.X);
+              this.cycles += 2;
+              break;
+
+            case 0xca: // DEX
+              this.X = (this.X - 1) & 0xff;
+              this.setZN(this.X);
+              this.cycles += 2;
+              break;
+
+            case 0xc8: // INY
+              this.Y = (this.Y + 1) & 0xff;
+              this.setZN(this.Y);
+              this.cycles += 2;
+              break;
+
+            case 0x88: // DEY
+              this.Y = (this.Y - 1) & 0xff;
+              this.setZN(this.Y);
+              this.cycles += 2;
+              break;
+
+            case 0x1a: // INC A
+              this.A = (this.A + 1) & 0xff;
+              this.setZN(this.A);
+              this.cycles += 2;
+              break;
+
+            case 0x3a: // DEC A
+              this.A = (this.A - 1) & 0xff;
+              this.setZN(this.A);
+              this.cycles += 2;
+              break;
+
+            // Arithmetic
+            case 0x69: // ADC #imm
+              const valADC = bus.read((this.PB << 16) | this.PC++);
+              let sum = this.A + valADC + (this.P & FLAG.C ? 1 : 0);
+              this.P = this.P & ~(FLAG.C | FLAG.V | FLAG.Z | FLAG.N);
+              if (sum > 0xff) this.P |= FLAG.C;
+              const result = sum & 0xff;
+              if (~(this.A ^ valADC) & (this.A ^ result) & 0x80) this.P |= FLAG.V;
+              this.A = result;
+              this.setZN(this.A);
+              this.cycles += 2;
+              break;
+
+            case 0xe9: // SBC #imm
+              const valSBC = bus.read((this.PB << 16) | this.PC++);
+              let diff = this.A - valSBC - (this.P & FLAG.C ? 0 : 1);
+              this.P = this.P & ~(FLAG.C | FLAG.V | FLAG.Z | FLAG.N);
+              if (diff >= 0) this.P |= FLAG.C;
+              const resSBC = diff & 0xff;
+              if ((this.A ^ valSBC) & (this.A ^ resSBC) & 0x80) this.P |= FLAG.V;
+              this.A = resSBC;
+              this.setZN(this.A);
+              this.cycles += 2;
+              break;
+// MODIFY LDA immediate
+case 0xa9:
+  if (this.P & FLAG.M) {
+    this.A = this.imm8(bus);
+  } else {
+    const lo = this.imm8(bus);
+    const hi = this.imm8(bus);
+    this.A = lo | (hi << 8);
+  }
+  this.setZN(this.A);
+  this.cycles += 2;
+  break;
+// ADD REP / SEP
+case 0xc2: this.P &= ~this.imm8(bus); break; // REP
+case 0xe2: this.P |=  this.imm8(bus); break; // SEP
+
+            // Logical operations
+            case 0x29: // AND #imm
+              this.A &= bus.read((this.PB << 16) | this.PC++);
+              this.setZN(this.A);
+              this.cycles += 2;
+              break;
+
+            case 0x09: // ORA #imm
+              this.A |= bus.read((this.PB << 16) | this.PC++);
+              this.setZN(this.A);
+              this.cycles += 2;
+              break;
+
+            case 0x49: // EOR #imm
+              this.A ^= bus.read((this.PB << 16) | this.PC++);
+              this.setZN(this.A);
+              this.cycles += 2;
+              break;
+
+            // Compare operations
+            case 0xc9: // CMP #imm
+              const valCMP = bus.read((this.PB << 16) | this.PC++);
+              const cmpRes = (this.A - valCMP) & 0xff;
+              this.P = (this.P & ~(FLAG.C | FLAG.Z | FLAG.N));
+              if (this.A >= valCMP) this.P |= FLAG.C;
+              if (this.A === valCMP) this.P |= FLAG.Z;
+              if (cmpRes & 0x80) this.P |= FLAG.N;
+              this.cycles += 2;
+              break;
+
+            case 0xe0: // CPX #imm
+              const valCPX = bus.read((this.PB << 16) | this.PC++);
+              const cpxRes = (this.X - valCPX) & 0xff;
+              this.P = (this.P & ~(FLAG.C | FLAG.Z | FLAG.N));
+              if (this.X >= valCPX) this.P |= FLAG.C;
+              if (this.X === valCPX) this.P |= FLAG.Z;
+              if (cpxRes & 0x80) this.P |= FLAG.N;
+              this.cycles += 2;
+              break;
+
+            case 0xc0: // CPY #imm
+              const valCPY = bus.read((this.PB << 16) | this.PC++);
+              const cpyRes = (this.Y - valCPY) & 0xff;
+              this.P = (this.P & ~(FLAG.C | FLAG.Z | FLAG.N));
+              if (this.Y >= valCPY) this.P |= FLAG.C;
+              if (this.Y === valCPY) this.P |= FLAG.Z;
+              if (cpyRes & 0x80) this.P |= FLAG.N;
+              this.cycles += 2;
+              break;
+
+            // Bit test
+            case 0x24: // BIT dp
+              const dpBIT = bus.read((this.PB << 16) | this.PC++);
+              const valBIT = bus.read((this.D + dpBIT) & 0xffff);
+              this.P = (this.P & ~(FLAG.Z | FLAG.N | FLAG.V));
+              if ((this.A & valBIT) === 0) this.P |= FLAG.Z;
+              if (valBIT & 0x80) this.P |= FLAG.N;
+              if (valBIT & 0x40) this.P |= FLAG.V;
+              this.cycles += 3;
+              break;
+
+            // Branches
+            case 0xf0: // BEQ
+              const offBEQ = bus.read((this.PB << 16) | this.PC++);
+              if (this.P & FLAG.Z) {
+                this.PC = (this.PC + ((offBEQ << 24) >> 24)) & 0xffff;
+                this.cycles += 1;
+              }
+              this.cycles += 2;
+              break;
+
+            case 0xd0: // BNE
+              const offBNE = bus.read((this.PB << 16) | this.PC++);
+              if (!(this.P & FLAG.Z)) {
+                this.PC = (this.PC + ((offBNE << 24) >> 24)) & 0xffff;
+                this.cycles += 1;
+              }
+              this.cycles += 2;
+              break;
+
+            case 0x90: // BCC
+              const offBCC = bus.read((this.PB << 16) | this.PC++);
+              if (!(this.P & FLAG.C)) {
+                this.PC = (this.PC + ((offBCC << 24) >> 24)) & 0xffff;
+                this.cycles += 1;
+              }
+              this.cycles += 2;
+              break;
+
+            case 0xb0: // BCS
+              const offBCS = bus.read((this.PB << 16) | this.PC++);
+              if (this.P & FLAG.C) {
+                this.PC = (this.PC + ((offBCS << 24) >> 24)) & 0xffff;
+                this.cycles += 1;
+              }
+              this.cycles += 2;
+              break;
+
+            case 0x30: // BMI
+              const offBMI = bus.read((this.PB << 16) | this.PC++);
+              if (this.P & FLAG.N) {
+                this.PC = (this.PC + ((offBMI << 24) >> 24)) & 0xffff;
+                this.cycles += 1;
+              }
+              this.cycles += 2;
+              break;
+
+            case 0x10: // BPL
+              const offBPL = bus.read((this.PB << 16) | this.PC++);
+              if (!(this.P & FLAG.N)) {
+                this.PC = (this.PC + ((offBPL << 24) >> 24)) & 0xffff;
+                this.cycles += 1;
+              }
+              this.cycles += 2;
+              break;
+
+            case 0x50: // BVC
+              const offBVC = bus.read((this.PB << 16) | this.PC++);
+              if (!(this.P & FLAG.V)) {
+                this.PC = (this.PC + ((offBVC << 24) >> 24)) & 0xffff;
+                this.cycles += 1;
+              }
+              this.cycles += 2;
+              break;
+
+            case 0x70: // BVS
+              const offBVS = bus.read((this.PB << 16) | this.PC++);
+              if (this.P & FLAG.V) {
+                this.PC = (this.PC + ((offBVS << 24) >> 24)) & 0xffff;
+                this.cycles += 1;
+              }
+              this.cycles += 2;
+              break;
+
+            case 0x80: // BRA
+              const offBRA = bus.read((this.PB << 16) | this.PC++);
+              this.PC = (this.PC + ((offBRA << 24) >> 24)) & 0xffff;
+              this.cycles += 3;
+              break;
+
+            // Jumps and Calls
+            case 0x4c: // JMP abs
+              const loJMP = bus.read((this.PB << 16) | this.PC++);
+              const hiJMP = bus.read((this.PB << 16) | this.PC++);
+              this.PC = (hiJMP << 8) | loJMP;
+              this.cycles += 3;
+              break;
+
+            case 0x20: // JSR abs
+              const loJSR = bus.read((this.PB << 16) | this.PC++);
+              const hiJSR = bus.read((this.PB << 16) | this.PC++);
+              const ret = (this.PC - 1) & 0xffff;
+              bus.write(0x100 | (this.S-- & 0xff), (ret >> 8) & 0xff);
+              bus.write(0x100 | (this.S-- & 0xff), ret & 0xff);
+              this.PC = (hiJSR << 8) | loJSR;
+              this.cycles += 6;
+              break;
+
+            case 0x60: // RTS
+              const retLo = bus.read(0x100 | ((this.S + 1) & 0xff));
+              this.S = (this.S + 1) & 0x1ff;
+              const retHi = bus.read(0x100 | ((this.S + 1) & 0xff));
+              this.S = (this.S + 1) & 0x1ff;
+              this.PC = ((retHi << 8) | retLo) + 1;
+              this.cycles += 6;
+              break;
+
+            // Stack operations
+            case 0x48: // PHA
+              bus.write(0x100 | (this.S-- & 0xff), this.A & 0xff);
+              this.cycles += 3;
+              break;
+
+            case 0x68: // PLA
+              this.S = (this.S + 1) & 0x1ff;
+              this.A = bus.read(0x100 | (this.S & 0xff));
+              this.setZN(this.A);
+              this.cycles += 4;
+              break;
+
+            case 0x08: // PHP
+              bus.write(0x100 | (this.S-- & 0xff), this.P);
+              this.cycles += 3;
+              break;
+
+            case 0x28: // PLP
+              this.S = (this.S + 1) & 0x1ff;
+              this.P = bus.read(0x100 | (this.S & 0xff));
+              this.cycles += 4;
+              break;
+
+            case 0xda: // PHX
+              bus.write(0x100 | (this.S-- & 0xff), this.X & 0xff);
+              this.cycles += 3;
+              break;
+
+            case 0xfa: // PLX
+              this.S = (this.S + 1) & 0x1ff;
+              this.X = bus.read(0x100 | (this.S & 0xff));
+              this.setZN(this.X);
+              this.cycles += 4;
+              break;
+
+            case 0x5a: // PHY
+              bus.write(0x100 | (this.S-- & 0xff), this.Y & 0xff);
+              this.cycles += 3;
+              break;
+
+            case 0x7a: // PLY
+              this.S = (this.S + 1) & 0x1ff;
+              this.Y = bus.read(0x100 | (this.S & 0xff));
+              this.setZN(this.Y);
+              this.cycles += 4;
+              break;
+
+            // Transfer operations
+            case 0xaa: // TAX
+              this.X = this.A;
+              this.setZN(this.X);
+              this.cycles += 2;
+              break;
+
+            case 0xa8: // TAY
+              this.Y = this.A;
+              this.setZN(this.Y);
+              this.cycles += 2;
+              break;
+
+            case 0x8a: // TXA
+              this.A = this.X;
+              this.setZN(this.A);
+              this.cycles += 2;
+              break;
+
+            case 0x98: // TYA
+              this.A = this.Y;
+              this.setZN(this.A);
+              this.cycles += 2;
+              break;
+
+            case 0xba: // TSX
+              this.X = this.S & 0xff;
+              this.setZN(this.X);
+              this.cycles += 2;
+              break;
+
+            case 0x9a: // TXS
+              this.S = (this.S & 0x100) | this.X;
+              this.cycles += 2;
+              break;
+
+            // Flag operations
+            case 0x18: // CLC
+              this.P &= ~FLAG.C;
+              this.cycles += 2;
+              break;
+
+            case 0x38: // SEC
+              this.P |= FLAG.C;
+              this.cycles += 2;
+              break;
+
+            case 0x58: // CLI
+              this.P &= ~FLAG.I;
+              this.cycles += 2;
+              break;
+
+            case 0x78: // SEI
+              this.P |= FLAG.I;
+              this.cycles += 2;
+              break;
+
+            case 0xd8: // CLD
+              this.P &= ~FLAG.D;
+              this.cycles += 2;
+              break;
+
+            case 0xf8: // SED
+              this.P |= FLAG.D;
+              this.cycles += 2;
+              break;
+
+            case 0xb8: // CLV
+              this.P &= ~FLAG.V;
+              this.cycles += 2;
+              break;
+
+            // NOP
             case 0xea: // NOP
               this.cycles += 2;
               break;
-            case 0xa9: // LDA #imm (8bit)
-              const val = bus.read(this.PC);
-              this.PC = (this.PC + 1) & 0xffff;
-              this.A = val;
-              this.cycles += 2;
-              break;
+
             default:
-              console.warn("未実装 opcode:", opcode.toString(16));
               this.cycles += 2;
               break;
-          }
-        }
-      }
-      function updateDebug(cpu) {
-        document.getElementById("pc").textContent =
-          "0x" + cpu.PC.toString(16).padStart(4, "0");
-        document.getElementById("cyc").textContent = cpu.cycles;
-        document.getElementById("ram").textContent =
-          "A=0x" + cpu.A.toString(16).padStart(2, "0");
-        document.getElementById("mapper").textContent =
-          "X=0x" + cpu.X.toString(16).padStart(2, "0");
-        document.getElementById("apu").textContent =
-          "Y=0x" + cpu.Y.toString(16).padStart(2, "0");
-      }
-
-      CPU65C816.prototype.step = function (bus) {
-        const opcode = bus.read((this.PB << 16) | this.PC);
-        this.PC = (this.PC + 1) & 0xffff;
-
-        switch (opcode) {
-          case 0xea: // NOP
-            break;
-          case 0xa2: // LDX #imm
-            const immX = bus.read(this.PC++);
-            this.X = immX;
-            this.setZN(this.X);
-            this.cycles += 2;
-            break;
-          case 0xe8: // INX
-            this.X = (this.X + 1) & 0xff;
-            this.setZN(this.X);
-            this.cycles += 2;
-            break;
-
-          case 0xca: // DEX
-            this.X = (this.X - 1) & 0xff;
-            this.setZN(this.X);
-            this.cycles += 2;
-            break;
-
-          case 0xc8: // INY
-            this.Y = (this.Y + 1) & 0xff;
-            this.setZN(this.Y);
-            this.cycles += 2;
-            break;
-
-          case 0x88: // DEY
-            this.Y = (this.Y - 1) & 0xff;
-            this.setZN(this.Y);
-            this.cycles += 2;
-            break;
-          case 0xf0: // BEQ (branch if Z=1)
-            const offBEQ = bus.read(this.PC++);
-            if (this.P & FLAG.Z) {
-              this.PC = (this.PC + ((offBEQ << 24) >> 24)) & 0xffff; // 符号拡張
-              this.cycles += 1;
-            }
-            this.cycles += 2;
-            break;
-
-          case 0xd0: // BNE (branch if Z=0)
-            const offBNE = bus.read(this.PC++);
-            if (!(this.P & FLAG.Z)) {
-              this.PC = (this.PC + ((offBNE << 24) >> 24)) & 0xffff;
-              this.cycles += 1;
-            }
-            this.cycles += 2;
-            break;
-          case 0x48: // PHA
-            bus.write(0x100 | (this.S-- & 0xff), this.A & 0xff);
-            this.cycles += 3;
-            break;
-
-          case 0x68: // PLA
-            this.S = (this.S + 1) & 0x1ff;
-            this.A = bus.read(0x100 | (this.S & 0xff));
-            this.setZN(this.A);
-            this.cycles += 4;
-            break;
-          case 0x18: // CLC
-            this.P &= ~FLAG.C;
-            this.cycles += 2;
-            break;
-
-          case 0x38: // SEC
-            this.P |= FLAG.C;
-            this.cycles += 2;
-            break;
-
-          case 0x58: // CLI
-            this.P &= ~FLAG.I;
-            this.cycles += 2;
-            break;
-
-          case 0x78: // SEI
-            this.P |= FLAG.I;
-            this.cycles += 2;
-            break;
-
-          case 0x8e: // STX ab
-            const loX = bus.read(this.PC++);
-            const hiX = bus.read(this.PC++);
-            bus.write((hiX << 8) | loX, this.X);
-            this.cycles += 4;
-            break;
-          case 0x69: // ADC #imm
-            const valADC = bus.read(this.PC++);
-            let sum = this.A + valADC + (this.P & FLAG.C ? 1 : 0);
-            this.P = this.P & ~(FLAG.C | FLAG.V | FLAG.Z | FLAG.N);
-            if (sum > 0xff) this.P |= FLAG.C;
-            const result = sum & 0xff;
-            if (~(this.A ^ valADC) & (this.A ^ result) & 0x80) this.P |= FLAG.V;
-            this.A = result;
-            this.setZN(this.A);
-            this.cycles += 2;
-            break;
-          case 0x4c: // JMP abs
-            const loJ = bus.read(this.PC++);
-            const hiJ = bus.read(this.PC++);
-            this.PC = (hiJ << 8) | loJ;
-            this.cycles += 3;
-            break;
-
-          case 0x20: // JSR abs
-            const loS = bus.read(this.PC++);
-            const hiS = bus.read(this.PC++);
-            const ret = (this.PC - 1) & 0xffff;
-            bus.write(0x100 | (this.S-- & 0xff), (ret >> 8) & 0xff);
-            bus.write(0x100 | (this.S-- & 0xff), ret & 0xff);
-            this.PC = (hiS << 8) | loS;
-            this.cycles += 6;
-            break;
-          case 0x18: // CLC
-            this.P &= ~FLAG.C;
-            this.cycles += 2;
-            break;
-
-          case 0x38: // SEC
-            this.P |= FLAG.C;
-            this.cycles += 2;
-            break;
-
-          case 0xa9: // LDA #imm (8bit)
-            const value = bus.read((this.PB << 16) | this.PC);
-            this.PC = (this.PC + 1) & 0xffff;
-            this.A = value;
-            this.P =
-              (this.P & ~FLAG.Z & ~FLAG.N) |
-              (this.A === 0 ? FLAG.Z : 0) |
-              (this.A & 0x80 ? FLAG.N : 0);
-            break;
-
-          case 0x8d: // STA abs
-            const lo = bus.read((this.PB << 16) | this.PC);
-            const hi = bus.read((this.PB << 16) | ((this.PC + 1) & 0xffff));
-            this.PC = (this.PC + 2) & 0xffff;
-            const addr = (hi << 8) | lo;
-            bus.write(addr, this.A & 0xff);
-            break;
-
-          default:
-            console.warn(`未実装オペコード: ${opcode.toString(16)}`);
-            break;
-        }
+          }}
       };
 
       class Bus {
@@ -464,19 +820,62 @@ border:1px solid rgb(255, 255, 255);
           this.vramAddr = 0;
           this.cgramAddr = 0;
           this.oamAddr = 0;
+          // ADD at top of Bus constructor
+this.wram = new Uint8Array(128 * 1024); // 128KB WRAM
+this.joypad1 = 0;
+this.joypadShift = 0;
+this.nmiFlag = false;
+
         }
-        read(addr) {
-          if (addr >= 0x2100 && addr <= 0x21ff) {
-            // PPUレジスタ読み取り（未実装）
-            return 0;
-          }
-          return this.rom[addr % this.rom.length];
-        }
-        write(addr, val) {
-          if (addr === 0x2122) {
-            // CGRAMデータポート（簡易版）
-            this.ppu.writeCGRAM(0, val); // とりあえず背景色だけ
-          }
+       read(addr) {
+  addr &= 0xffffff;
+
+  // --- WRAM ---
+  if (addr < 0x200000) {
+    return this.wram[addr & 0x1ffff];
+  }
+
+  // --- PPU I/O ---
+  if (addr === 0x4210) {
+    const v = this.nmiFlag ? 0x80 : 0;
+    this.nmiFlag = false;
+    return v;
+  }
+
+  // --- Controller ---
+  if (addr === 0x4016) {
+    const v = (this.joypadShift & 1);
+    this.joypadShift >>= 1;
+    return v;
+  }
+
+  // --- ROM (LoROM) ---
+  const bank = addr >> 16;
+  const ofs = addr & 0x7fff;
+  if (ofs >= 0x8000) {
+    return this.rom[(bank * 0x8000 + ofs - 0x8000) % this.rom.length];
+  }
+
+  return 0;
+}
+
+       write(addr, val) {
+  addr &= 0xffffff;
+
+  // --- WRAM ---
+  if (addr < 0x200000) {
+    this.wram[addr & 0x1ffff] = val;
+    return;
+  }
+
+  // --- Controller latch ---
+  if (addr === 0x4016) {
+    if (val & 1) this.joypadShift = this.joypad1;
+    return;
+  }
+
+  // --- 既存PPU処理はそのまま ---
+
           switch (addr) {
             // --- VRAM ---
             case 0x2116: // VRAMアドレス低位
@@ -550,7 +949,7 @@ border:1px solid rgb(255, 255, 255);
         romData = new Uint8Array(await file.arrayBuffer());
         document.getElementById(
           "status"
-        ).textContent = `${file.name} 読み込み (${romData.length} bytes)`;
+        ).textContent;
         document.getElementById("start").disabled = false;
       });
 
@@ -559,6 +958,12 @@ border:1px solid rgb(255, 255, 255);
           cpu.step(bus);
         }
       }
+      // ADD globally
+const keys = {};
+window.addEventListener("keydown", e => keys[e.code] = true);
+window.addEventListener("keyup", e => keys[e.code] = false);
+
+
       document.getElementById("start").addEventListener("click", () => {
         const canvas = document.getElementById("screen");
 
@@ -568,16 +973,31 @@ border:1px solid rgb(255, 255, 255);
         const bus = new Bus(romData, ppu);
         resetCPU(cpu, romData, "LoROM");
         ppu.reset();
+        // ADD before frame()
+bus.joypad1 =
+  (keys.ArrowRight ? 1 << 0 : 0) |
+  (keys.ArrowLeft  ? 1 << 1 : 0) |
+  (keys.ArrowDown  ? 1 << 2 : 0) |
+  (keys.ArrowUp    ? 1 << 3 : 0) |
+  (keys.KeyZ       ? 1 << 4 : 0) |
+  (keys.KeyX       ? 1 << 5 : 0) |
+  (keys.Enter      ? 1 << 7 : 0);
+
         function frame() {
-          for (let i = 0; i < 2000; i++) {
-            cpu.step(bus);
-          }
+          // MODIFY frame()
+for (let i = 0; i < 20000; i++) cpu.step(bus);
+ppu.startVBlank(bus);
+// MODIFY frame()
+
+ppu.renderSprites();
+
+document.getElementById("addr").textContent="0x"+cpu.PC.toString(16);
           // CPUがCGRAMに色を書き込む（青色）
 
           // 背景色を描画
           ppu.renderBGColor();
           ppu.renderBG1(); // 後で本物の描画に置き換える
-          updateDebug(cpu);
+          //updateDebug(cpu);
           requestAnimationFrame(frame);
         }
 
