@@ -118,6 +118,9 @@ this.vblank = false;
           this.vram.fill(0);
           this.cgram.fill(0);
           this.oam.fill(0);
+this.cgram = new Uint16Array(256);
+this.cgramLatch = 0;
+this.cgramLow = true;
 
           // レジスタ初期化
           this.inidisp = 0x80; // 画面OFF
@@ -139,9 +142,16 @@ this.vblank = false;
         }
 
         // CGRAM書き込み（パレット）
-        writeCGRAM(addr, value) {
-          this.cgram[addr & 0x1ff] = value;
-        }
+       writeCGRAM(addr, value) {
+  if (this.cgramLow) {
+    this.cgramLatch = value;
+    this.cgramLow = false;
+  } else {
+    this.cgram[addr >> 1] = this.cgramLatch | (value << 8);
+    this.cgramLow = true;
+  }
+}
+
 startVBlank() {
   this.vblank = true;
 }
@@ -159,14 +169,13 @@ startVBlank() {
           return this.oam[addr % 544];
         }
         getColor(index) {
-          const lo = this.cgram[index * 2];
-          const hi = this.cgram[index * 2 + 1];
-          const color = lo | (hi << 8);
-          const r = (color & 0x1f) << 3;
-          const g = ((color >> 5) & 0x1f) << 3;
-          const b = ((color >> 10) & 0x1f) << 3;
-          return (255 << 24) | (b << 16) | (g << 8) | r;
-        }
+  const color = this.cgram[index] & 0x7fff;
+  const r = (color & 0x1f) << 3;
+  const g = ((color >> 5) & 0x1f) << 3;
+  const b = ((color >> 10) & 0x1f) << 3;
+  return (255 << 24) | (b << 16) | (g << 8) | r;
+}
+
 // ADD
 renderSprites() {
   for (let i = 0; i < 128; i++) {
@@ -206,23 +215,27 @@ renderSprites() {
         }
 
         // --- 背景マップを描画 ---
-        renderBG1() {
+       renderBG1() {
   if (this.bgMode !== 1) return;
 
+  const mapBase = this.bg1MapBase;
   for (let ty = 0; ty < 28; ty++) {
     for (let tx = 0; tx < 32; tx++) {
-      const mapAddr = this.bg1MapBase + (ty * 32 + tx) * 2;
-      const lo = this.vram[mapAddr];
-      const hi = this.vram[mapAddr + 1];
+      const addr = mapBase + (ty * 32 + tx) * 2;
+      const tileIndex =
+        this.vram[addr] | ((this.vram[addr + 1] & 0x03) << 8);
+      const paletteIndex = (this.vram[addr + 1] >> 2) & 0x07;
 
-      const tile = lo | ((hi & 0x03) << 8);
-      const palette = (hi >> 2) & 0x07;
-
-      const tileAddr = this.bg1TileBase + tile * 32;
-      this.drawTileAt(tileAddr, palette, tx * 8, ty * 8);
+      this.drawTile(
+        tileIndex,
+        paletteIndex,
+        tx * 8 - this.bg1ScrollX,
+        ty * 8 - this.bg1ScrollY
+      );
     }
   }
 }
+
 drawTileAt(addr, pal, dx, dy) {
   for (let y = 0; y < 8; y++) {
     const p0 = this.vram[addr + y * 2];
@@ -257,29 +270,18 @@ startVBlank(bus) {
   bus.nmiFlag = true;
 }
 
-        renderBG1() {
-          const mapBase = 0x0000;
-          for (let ty = 0; ty < 28; ty++) {
-            for (let tx = 0; tx < 32; tx++) {
-              const addr = mapBase + (ty * 32 + tx) * 2;
-              const tileIndex =
-                this.vram[addr] | ((this.vram[addr + 1] & 0x03) << 8);
-              const paletteIndex = (this.vram[addr + 1] >> 2) & 0x07;
-              this.drawTile(
-                tileIndex,
-                paletteIndex,
-                tx * 8 - this.bg1ScrollX,
-                ty * 8 - this.bg1ScrollY
-              );
-            }
-          }
-          this.flush();
-        }
+       
         renderBGColor() {
-          const col = this.getColor(0); // パレット0番を背景色に
-          this.buffer.fill(col);
-          this.flush();
-        }
+  // 画面OFFならバックドロップのみ
+  if (this.inidisp & 0x80) {
+    this.buffer.fill(0xff000000); // 黒
+    return;
+  }
+
+  const col = this.getColor(0);
+  this.buffer.fill(col);
+}
+
         flush() {
           const buf8 = new Uint8ClampedArray(this.buffer.buffer);
           this.imageData.data.set(buf8);
@@ -317,7 +319,7 @@ startVBlank(bus) {
   const hi = bus.read(0x00fffd);
 
   this.PC = lo | (hi << 8);
-
+this.op;
   // 初期CPU状態（最低限）
   this.SP = 0x1ff;
   this.P  = 0x34;   // IRQ禁止・8bitモード
@@ -353,6 +355,22 @@ abs(bus) {
             this.P &= ~FLAG.N;
           }
         }
+        read8(bus) {
+  const val = bus.read((this.PB << 16) | this.PC);
+  this.PC = (this.PC + 1) & 0xffff;
+  return val;
+}
+
+read16(bus) {
+  const lo = this.read8(bus);
+  const hi = this.read8(bus);
+  return lo | (hi << 8);
+}
+
+updateWidthFlags() {
+  this.mWidth = (this.P & 0x20) === 0 ? 16 : 8;
+  this.xWidth = (this.P & 0x10) === 0 ? 16 : 8;
+}
 
         step(bus) {
           const opcode = bus.read((this.PB << 16) | this.PC);
@@ -372,7 +390,11 @@ if (bus.nmiFlag && !(this.P & FLAG.I)) {
   return;
 }
 
+
+this.op=opcode;
           switch (opcode) {
+          
+
             // Load/Store operations
             case 0xa9: // LDA #imm
               this.A = bus.read((this.PB << 16) | this.PC);
@@ -452,12 +474,24 @@ case 0xbd: { // LDA abs,X
               this.cycles += 3;
               break;
 
-            case 0x8d: // STA abs
-              const loSA = bus.read((this.PB << 16) | this.PC++);
-              const hiSA = bus.read((this.PB << 16) | this.PC++);
-              bus.write((hiSA << 8) | loSA, this.A & 0xff);
-              this.cycles += 4;
-              break;
+            // STA absolute
+case 0x8D: { // STA absolute
+  const lo = this.read8(bus);
+  const hi = this.read8(bus);
+  const addr = (this.PB << 16) | (hi << 8) | lo;
+
+  if (this.mWidth === 16) {
+    bus.write(addr, this.A & 0xff);
+    bus.write(addr + 1, (this.A >> 8) & 0xff);
+  } else {
+    bus.write(addr, this.A & 0xff);
+  }
+
+  this.cycles += 4;
+  break;
+}
+
+
 
             case 0x86: // STX dp
               const dpSX = bus.read((this.PB << 16) | this.PC++);
@@ -650,6 +684,17 @@ case 0xe2: this.P |=  this.imm8(bus); break; // SEP
               }
               this.cycles += 2;
               break;
+case 0x9C: { // STZ absolute
+  const lo = this.read8(bus);
+  const hi = this.read8(bus);
+  const addr = (this.PB << 16) | (hi << 8) | lo;
+
+  bus.write(addr, 0);
+  bus.write(addr + 1, 0);
+
+  this.cycles += 4;
+  break;
+}
 
             case 0xb0: // BCS
               const offBCS = bus.read((this.PB << 16) | this.PC++);
@@ -719,6 +764,23 @@ case 0xe2: this.P |=  this.imm8(bus); break; // SEP
               this.PC = (hiJSR << 8) | loJSR;
               this.cycles += 6;
               break;
+// REP imm
+case 0xC2: {
+  const val = this.read8(bus);
+  this.P &= ~val;
+  this.updateWidthFlags();
+  this.cycles += 3;
+  break;
+}
+
+// SEP imm
+case 0xE2: {
+  const val = this.read8(bus);
+  this.P |= val;
+  this.updateWidthFlags();
+  this.cycles += 3;
+  break;
+}
 
             case 0x60: // RTS
               const retLo = bus.read(0x100 | ((this.S + 1) & 0xff));
@@ -888,9 +950,17 @@ this.dma = {
        read(addr) {
   addr &= 0xffffff;
 
-if (addr === 0x2100) {
-  console.log("INIDISP WRITE");
+// --- LoROM ---
+const bankn = (addr >> 16) & 0xff;
+const offs = addr & 0xffff;
+
+if (offs >= 0x8000 && bankn <= 0x7d) {
+  const romAddr = ((bankn * 0x8000) + (offs & 0x7fff));
+  if (romAddr < this.rom.length) {
+    return this.rom[romAddr];
+  }
 }
+
 
   // --- WRAM ---
   if (addr < 0x200000) {
@@ -959,6 +1029,21 @@ runDMA() {
 
        write(addr, val) {
   addr &= 0xffffff;
+  if (addr === 0x420b) {
+  console.log("DMA START WRITE", val);
+}
+if ((addr & 0xffff) === 0x420b) {
+  console.log("DMA START WRITE", val);
+  this.runDMA();
+  return;
+}
+
+if (addr === 0x2100) {
+  console.log("INIDISP WRITE", val.toString(16));
+}
+if (addr >= 0x2000 && addr <= 0x21ff) {
+  console.log("WRITE IO", addr.toString(16), val.toString(16));
+}
 
   // --- WRAM ---
   // --- WRAM (正しい範囲) ---
@@ -1158,12 +1243,13 @@ ppu.startVBlank(bus);
 ppu.renderSprites();
 //bus.write(0x2100, 0x0F); // brightness max, screen ON
 
-document.getElementById("addr").textContent="0x"+cpu.PC.toString(16);
+document.getElementById("addr").textContent="0x"+cpu.PC.toString(16)+":0x"+cpu.PC.toString(16);
           // CPUがCGRAMに色を書き込む（青色）
 console.log(ppu.cgram.slice(0, 4));
 
 
 console.log(ppu.inidisp);
+
 
           // 背景色を描画
           ppu.renderBGColor();
