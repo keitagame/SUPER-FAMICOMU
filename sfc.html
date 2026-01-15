@@ -965,6 +965,8 @@ this.joypad1 = 0;
 this.joypadShift = 0;
 this.nmiFlag = false;
 // ADD
+this.ppu.bg1TileBase = 0;
+
 this.vramInc = 1;
 this.vramLowHigh = 0;
 
@@ -1006,12 +1008,13 @@ if (addr === 0x4212) { // HVBJOY
     this.nmiFlag = false;
     return v;
   }
-if (addr === 0x2115) { // VMAIN
+if (addr === 0x2115) {
   const incTable = [1, 32, 128, 128];
   this.vramInc = incTable[val & 0x03];
   this.vramLowHigh = (val >> 7) & 1;
   return;
 }
+
 if (addr === 0x4210) { // RDNMI
   const v = this.ppu.vblank ? 0x80 : 0x00;
   this.ppu.vblank = false; // 読むとクリア
@@ -1166,19 +1169,21 @@ case 0x212d: // TS - Sub Screen
             case 0x2117: // VRAMアドレス高位
               this.vramAddr = (this.vramAddr & 0x00ff) | (val << 8);
               break;
-           case 0x2118: // VRAM low
+         case 0x2118: // low
   this.ppu.writeVRAM(this.vramAddr, val);
   if (this.vramLowHigh === 0) {
     this.vramAddr = (this.vramAddr + this.vramInc) & 0xffff;
   }
   break;
 
-case 0x2119: // VRAM high
+case 0x2119: // high
   this.ppu.writeVRAM(this.vramAddr + 1, val);
   if (this.vramLowHigh === 1) {
     this.vramAddr = (this.vramAddr + this.vramInc) & 0xffff;
   }
   break;
+
+
 
 
             // --- CGRAM ---
@@ -1290,6 +1295,9 @@ ppu.renderSprites();
 document.getElementById("addr").textContent="0x"+cpu.PC.toString(16)+":0x"+cpu.PC.toString(16);
           // CPUがCGRAMに色を書き込む（青色）
 console.log(ppu.cgram.slice(0, 4));
+bus.write(0x2100, 0x0F); // 画面ON + 最大輝度
+bus.write(0x212C, 0x01); // BG1 ON
+
 
 
 console.log(ppu.inidisp);
