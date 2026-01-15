@@ -109,6 +109,9 @@ this.vblank = false;
           this.cgramAddr = 0;
           this.oamAddr = 0;
           this.bg1ScrollX = 0;
+          this.mainScreen = 0;
+this.subScreen = 0;
+
           this.bg1ScrollY = 0;
           this.buffer = new Uint32Array(this.width * this.height);
           this.imageData = ctx.createImageData(this.width, this.height);
@@ -213,28 +216,48 @@ renderSprites() {
             }
           }
         }
+drawTile2bpp(addr, pal, dx, dy) {
+  for (let y = 0; y < 8; y++) {
+    const p0 = this.vram[addr + y * 2];
+    const p1 = this.vram[addr + y * 2 + 1];
 
-        // --- 背景マップを描画 ---
-       renderBG1() {
-  if (this.bgMode !== 1) return;
-
-  const mapBase = this.bg1MapBase;
-  for (let ty = 0; ty < 28; ty++) {
-    for (let tx = 0; tx < 32; tx++) {
-      const addr = mapBase + (ty * 32 + tx) * 2;
-      const tileIndex =
-        this.vram[addr] | ((this.vram[addr + 1] & 0x03) << 8);
-      const paletteIndex = (this.vram[addr + 1] >> 2) & 0x07;
-
-      this.drawTile(
-        tileIndex,
-        paletteIndex,
-        tx * 8 - this.bg1ScrollX,
-        ty * 8 - this.bg1ScrollY
-      );
+    for (let x = 0; x < 8; x++) {
+      const bit = 7 - x;
+      const c = ((p0 >> bit) & 1) | (((p1 >> bit) & 1) << 1);
+      if (c === 0) continue;
+      this.buffer[(dy + y) * this.width + (dx + x)] =
+        this.getColor(pal * 4 + c);
     }
   }
 }
+
+        // --- 背景マップを描画 ---
+     renderBG1() {
+  // 画面OFFなら描かない
+  if (this.inidisp & 0x80) return;
+
+  // BG1 無効
+  if ((this.mainScreen & 0x01) === 0) return;
+
+  // モード0のみ
+  if (this.bgMode !== 0) return;
+
+  for (let ty = 0; ty < 28; ty++) {
+    for (let tx = 0; tx < 32; tx++) {
+      const mapAddr = this.bg1MapBase + (ty * 32 + tx) * 2;
+      const lo = this.vram[mapAddr];
+      const hi = this.vram[mapAddr + 1];
+
+      const tile = lo | ((hi & 0x03) << 8);
+      const pal  = (hi >> 2) & 0x07;
+
+      const tileAddr = this.bg1TileBase + tile * 16; // 2bpp
+      this.drawTile2bpp(tileAddr, pal, tx * 8, ty * 8);
+    }
+  }
+}
+
+
 
 drawTileAt(addr, pal, dx, dy) {
   for (let y = 0; y < 8; y++) {
@@ -283,10 +306,17 @@ startVBlank(bus) {
 }
 
         flush() {
-          const buf8 = new Uint8ClampedArray(this.buffer.buffer);
-          this.imageData.data.set(buf8);
-          this.ctx.putImageData(this.imageData, 0, 0);
-        }
+  const data = this.imageData.data;
+  for (let i = 0; i < this.buffer.length; i++) {
+    const c = this.buffer[i];
+    data[i * 4 + 0] = c & 0xff;         // R
+    data[i * 4 + 1] = (c >> 8) & 0xff;  // G
+    data[i * 4 + 2] = (c >> 16) & 0xff; // B
+    data[i * 4 + 3] = (c >> 24) & 0xff; // A
+  }
+  this.ctx.putImageData(this.imageData, 0, 0);
+}
+
       }
 
       const FLAG = {
@@ -1116,6 +1146,20 @@ if (addr === 0x420b && (val & 1)) {
 
           switch (addr) {
             // --- VRAM ---
+            case 0x2107: // BG1SC
+  this.ppu.bg1MapBase = (val & 0x7c) << 8;
+  break;
+case 0x210b: // BG12NBA
+  this.ppu.bg1TileBase = (val & 0x0f) << 12;
+  break;
+case 0x212c: // TM - Main Screen
+  this.ppu.mainScreen = val;
+  break;
+
+case 0x212d: // TS - Sub Screen
+  this.ppu.subScreen = val;
+  break;
+
             case 0x2116: // VRAMアドレス低位
               this.vramAddr = (this.vramAddr & 0xff00) | val;
               break;
