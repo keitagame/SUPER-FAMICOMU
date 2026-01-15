@@ -63,7 +63,7 @@ border:1px solid rgb(255, 255, 255);
       <button id="start" disabled>Start</button>
       <div class="mono" id="status">No ROM</div>
       <div class="mono" id="addr">0x0000</div>
-      <input type="text" id="myInput" value="30" />
+      <input type="text" id="myInput" value="30" style="display:none"/>
     </header>
     <div class="row">
       <canvas id="screen" width="256" height="240"></canvas>
@@ -88,6 +88,13 @@ border:1px solid rgb(255, 255, 255);
     <script type="module">
       class PPU {
         constructor(ctx) {
+          // ADD
+this.bgMode = 0;
+this.bg1TileBase = 0x0000;
+this.bg1MapBase  = 0x0000;
+// constructor
+this.vblank = false;
+
           this.ctx = ctx;
           this.width = 256;
           this.height = 224;
@@ -118,7 +125,7 @@ border:1px solid rgb(255, 255, 255);
           this.vramAddr = 0;
           this.cgramAddr = 0;
           this.oamAddr = 0;
-
+         
           // 背景を黒で塗る
           this.buffer.fill(0xff000000);
           this.flush();
@@ -135,6 +142,9 @@ border:1px solid rgb(255, 255, 255);
         writeCGRAM(addr, value) {
           this.cgram[addr & 0x1ff] = value;
         }
+startVBlank() {
+  this.vblank = true;
+}
 
         readCGRAM(addr) {
           return this.cgram[addr & 0x1ff];
@@ -197,20 +207,44 @@ renderSprites() {
 
         // --- 背景マップを描画 ---
         renderBG1() {
-          const col = this.getColor(0);
-          // 仮にVRAMの0x0000にBGマップがあるとする
-          const mapBase = 0x0000;
-          for (let ty = 0; ty < 28; ty++) {
-            for (let tx = 0; tx < 32; tx++) {
-              const addr = mapBase + (ty * 32 + tx) * 2;
-              const tileIndex =
-                this.vram[addr] | ((this.vram[addr + 1] & 0x03) << 8);
-              const paletteIndex = (this.vram[addr + 1] >> 2) & 0x07;
-              this.drawTile(tileIndex, paletteIndex, tx * 8, ty * 8);
-            }
-          }
-          this.flush();
-        }
+  if (this.bgMode !== 1) return;
+
+  for (let ty = 0; ty < 28; ty++) {
+    for (let tx = 0; tx < 32; tx++) {
+      const mapAddr = this.bg1MapBase + (ty * 32 + tx) * 2;
+      const lo = this.vram[mapAddr];
+      const hi = this.vram[mapAddr + 1];
+
+      const tile = lo | ((hi & 0x03) << 8);
+      const palette = (hi >> 2) & 0x07;
+
+      const tileAddr = this.bg1TileBase + tile * 32;
+      this.drawTileAt(tileAddr, palette, tx * 8, ty * 8);
+    }
+  }
+}
+drawTileAt(addr, pal, dx, dy) {
+  for (let y = 0; y < 8; y++) {
+    const p0 = this.vram[addr + y * 2];
+    const p1 = this.vram[addr + y * 2 + 1];
+    const p2 = this.vram[addr + 16 + y * 2];
+    const p3 = this.vram[addr + 16 + y * 2 + 1];
+
+    for (let x = 0; x < 8; x++) {
+      const bit = 7 - x;
+      const c =
+        ((p0 >> bit) & 1) |
+        (((p1 >> bit) & 1) << 1) |
+        (((p2 >> bit) & 1) << 2) |
+        (((p3 >> bit) & 1) << 3);
+
+      if (c === 0) continue;
+      this.buffer[(dy + y) * this.width + (dx + x)] =
+        this.getColor(pal * 16 + c);
+    }
+  }
+}
+
         // テスト用: グラデーション描画
         setScrollX(val) {
           this.bg1ScrollX = val;
@@ -277,6 +311,19 @@ startVBlank(bus) {
           this.emulation = true;
           this.cycles = 0;
         }
+        reset(bus) {
+  // SNES RESET vector ($00:FFFC)
+  const lo = bus.read(0x00fffc);
+  const hi = bus.read(0x00fffd);
+
+  this.PC = lo | (hi << 8);
+
+  // 初期CPU状態（最低限）
+  this.SP = 0x1ff;
+  this.P  = 0x34;   // IRQ禁止・8bitモード
+  this.A = this.X = this.Y = 0;
+}
+
         // ADD inside CPU class
 read16(bus, addr) {
   const lo = bus.read(addr);
@@ -826,6 +873,9 @@ this.joypad1 = 0;
 this.joypadShift = 0;
 this.nmiFlag = false;
 // ADD
+this.vramInc = 1;
+this.vramLowHigh = 0;
+
 this.dma = {
   enabled: false,
   src: 0,
@@ -838,10 +888,17 @@ this.dma = {
        read(addr) {
   addr &= 0xffffff;
 
+if (addr === 0x2100) {
+  console.log("INIDISP WRITE");
+}
+
   // --- WRAM ---
   if (addr < 0x200000) {
     return this.wram[addr & 0x1ffff];
   }
+if (addr === 0x4212) { // HVBJOY
+  return this.ppu.vblank ? 0x80 : 0x00;
+}
 
   // --- PPU I/O ---
   if (addr === 0x4210) {
@@ -849,6 +906,17 @@ this.dma = {
     this.nmiFlag = false;
     return v;
   }
+if (addr === 0x2115) { // VMAIN
+  const incTable = [1, 32, 128, 128];
+  this.vramInc = incTable[val & 0x03];
+  this.vramLowHigh = (val >> 7) & 1;
+  return;
+}
+if (addr === 0x4210) { // RDNMI
+  const v = this.ppu.vblank ? 0x80 : 0x00;
+  this.ppu.vblank = false; // 読むとクリア
+  return v;
+}
 
   // --- Controller ---
   if (addr === 0x4016) {
@@ -899,6 +967,20 @@ if (addr >= 0x7e0000 && addr <= 0x7fffff) {
   return;
 }
 
+if (addr === 0x2105) { // BGMODE
+  this.ppu.bgMode = val & 0x07;
+  return;
+}
+
+if (addr === 0x2107) { // BG1SC (tilemap base)
+  this.ppu.bg1MapBase = (val & 0x7C) << 9; // ×0x400
+  return;
+}
+
+if (addr === 0x210B) { // BG12NBA (tile data base)
+  this.ppu.bg1TileBase = (val & 0x0F) << 13; // ×0x2000
+  return;
+}
 
   // --- Controller latch ---
   if (addr === 0x4016) {
@@ -955,14 +1037,20 @@ if (addr === 0x420b && (val & 1)) {
             case 0x2117: // VRAMアドレス高位
               this.vramAddr = (this.vramAddr & 0x00ff) | (val << 8);
               break;
-            case 0x2118: // VRAMデータポート (低位)
-              this.ppu.writeVRAM(this.vramAddr, val);
-              this.vramAddr = (this.vramAddr + 1) & 0xffff;
-              break;
-            case 0x2119: // VRAMデータポート (高位)
-              this.ppu.writeVRAM(this.vramAddr, val);
-              this.vramAddr = (this.vramAddr + 1) & 0xffff;
-              break;
+           case 0x2118: // VRAM low
+  this.ppu.writeVRAM(this.vramAddr, val);
+  if (this.vramLowHigh === 0) {
+    this.vramAddr = (this.vramAddr + this.vramInc) & 0xffff;
+  }
+  break;
+
+case 0x2119: // VRAM high
+  this.ppu.writeVRAM(this.vramAddr + 1, val);
+  if (this.vramLowHigh === 1) {
+    this.vramAddr = (this.vramAddr + this.vramInc) & 0xffff;
+  }
+  break;
+
 
             // --- CGRAM ---
 
@@ -994,25 +1082,28 @@ if (addr === 0x420b && (val & 1)) {
         }
       }
       let romData = null;
-      function resetCPU(cpu, romData, mapping = "LoROM") {
-        let lo, hi;
+     function resetCPU(cpu, romData, mapping = "LoROM") {
+  const hasHeader = (romData.length & 0x7fff) === 512;
+  const off = hasHeader ? 0x200 : 0;
 
-        if (mapping === "LoROM") {
-          lo = romData[0x7ffc];
-          hi = romData[0x7ffd];
-        } else if (mapping === "HiROM") {
-          lo = romData[0xfffc];
-          hi = romData[0xfffd];
-        } else {
-          throw new Error("Unknown mapping type");
-        }
+  let lo, hi;
+  if (mapping === "LoROM") {
+    lo = romData[off + 0x7ffc];
+    hi = romData[off + 0x7ffd];
+  } else {
+    lo = romData[off + 0xfffc];
+    hi = romData[off + 0xfffd];
+  }
 
-        cpu.PC = (hi << 8) | lo; // リセットベクタからPCを設定
-        cpu.PB = 0x00; // プログラムバンクは0から開始
-        cpu.S = 0x1ff; // スタックポインタ初期化
-        cpu.P = 0x34; // ステータスフラグ初期値
-        cpu.emulation = true; // 6502互換モードで開始
-      }
+  cpu.PC = (hi << 8) | lo;
+  cpu.PB = 0x00;
+  cpu.S  = 0x1ff;
+  cpu.P  = 0x34;
+  cpu.emulation = true;
+
+  console.log("RESET PC =", cpu.PC.toString(16));
+}
+
 
       document.getElementById("rom").addEventListener("change", async (e) => {
         const file = e.target.files[0];
@@ -1042,6 +1133,8 @@ window.addEventListener("keyup", e => keys[e.code] = false);
         const ctx = canvas.getContext("2d");
         const ppu = new PPU(ctx);
         const bus = new Bus(romData, ppu);
+        //cpu.reset(bus);
+
         resetCPU(cpu, romData, "LoROM");
         ppu.reset();
         // ADD before frame()
